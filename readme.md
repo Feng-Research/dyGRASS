@@ -44,6 +44,30 @@ Pkg.add([
 ])
 ```
 
+## Input File Requirements
+
+### File Format
+All graph files must be in **Matrix Market (.mtx) format**:
+- **1-based indexing** (automatically converted to 0-based internally)
+- Standard MTX header (optional, will be skipped)
+- Format: `source destination [weight]`
+
+### Required Files per Dataset
+```
+dataset/<graph_name>/
+├── adj_sparse.mtx     # Initial sparse graph (1-based, weighted)
+├── ext.mtx           # Extension edges for incremental (1-based, weighted)  
+├── dense.mtx         # Dense graph for decremental (1-based, weighted)
+├── del.mtx          # Deletion candidates for decremental (1-based, unweighted)
+└── updated_dense.mtx # Updated dense graph (1-based, weighted)
+```
+
+### File Specifications
+- **Weighted files** (`adj_sparse.mtx`, `ext.mtx`, `dense.mtx`, `updated_dense.mtx`): Include edge weights
+- **Unweighted files** (`del.mtx`): No weights, format: `source destination`
+- **Headers**: MTX headers are automatically detected and skipped
+- **Index Format**: 1-based indexing in files (converted to 0-based internally)
+
 ## Usage
 
 ```bash
@@ -61,6 +85,12 @@ Pkg.add([
 # example
 ./random_walk_decremental/decremental_update 333SP
 ```
+
+### Common Issues
+- Ensure all vertex IDs are consecutive starting from 1
+- Check file permissions for dataset directory
+- Verify CUDA GPU memory is sufficient for large graphs
+- Make sure `nvcc` is in your PATH for compilation
 
 ## Citing
 
