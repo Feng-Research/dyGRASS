@@ -1,5 +1,22 @@
-//10/03/2016
-//Graph data structure on GPUs
+/**
+ * GPU Graph Data Structures for dyGRASS Random Walk Decremental Processing
+ * 
+ * This header defines CUDA-optimized data structures for decremental graph sparsification:
+ * - GPU_Dual_Graph: Manages both dense (original) and sparse (sparsified) graphs
+ * - Random walk data structures for parallel CUDA processing
+ * - Edge removal and recovery operations with O(1) edge mapping
+ * - Heuristic recovery for disconnected components
+ * 
+ * Key Features for Decremental Processing:
+ * - Dual graph management (dense source graph + sparse result graph)
+ * - Efficient edge deletion using hash-based edge mapping
+ * - Batch processing with filtering for existing edges
+ * - Recovery path reconstruction when alternative connections exist
+ * - Heuristic fallback for maintaining essential connectivity
+ * 
+ * Enhanced for dyGRASS decremental graph sparsification
+ */
+
 #ifndef _GPU_GRAPH_H_
 #define _GPU_GRAPH_H_
 #include <iostream>
@@ -11,11 +28,17 @@
 #include "functions.h"
 #include <curand_kernel.h>
 #include <assert.h>
-#include <unordered_map>
-#include <unordered_set>
+#include <unordered_map>  // for O(1) edge mapping
+#include <unordered_set>  // for tracking added edges
 
 using namespace std;
 
+/**
+ * CUDA Error Handling Utilities
+ * 
+ * Provides centralized error checking for all CUDA API calls
+ * to ensure failures are caught and reported immediately.
+ */
 static void HandleError( cudaError_t err,
                          const char *file,
                          int line ) {
@@ -27,95 +50,136 @@ static void HandleError( cudaError_t err,
     }
 }
 
+// Macro for convenient error checking: H_ERR(cudaMalloc(...))
 #define H_ERR( err )(HandleError( err, __FILE__, __LINE__ ))
 
 
 
 
 
+/**
+ * GPU Dual Graph Manager for Decremental Sparsification
+ * 
+ * This class manages the complex decremental sparsification process by maintaining
+ * two graph representations:
+ * 
+ * 1. **Dense Graph**: Updated dense graph with candidate edges removed, used for pathfinding
+ * 2. **Sparse Graph**: Target sparsified graph that edges are removed from
+ * 
+ * Decremental Algorithm:
+ * 1. Remove candidate edges from both dense and sparse graphs
+ * 2. Test connectivity using random walks on the updated dense graph
+ * 3. If alternative paths exist: edge removal is successful (sparsification)
+ * 4. If no paths found: recover edge to sparse graph (maintain connectivity)
+ * 5. Use heuristic recovery for essential connectivity preservation
+ * 
+ * Key Innovation: Dual graph approach allows testing connectivity on updated dense graph
+ * while progressively building sparsified result in sparse graph.
+ */
 class GPU_Dual_Graph{
-    // manage both dense and sparse graph
-    // random walk on the dense graph to find recovery edges
 
     public:
-        //shared properties
-        vertex_t vertex_num;
-        index_t divisor; // for divide input edge flow
-        long multiplier; // for map decode
-        index_t heuristic_sample_num;
-        vertex_t * heuristic_sample_nodes;
-        vertex_t * heuristic_sample_nodes_device;
-        unordered_set<long> * added_edges; // to store the edges that are added to the sparse graph
+        // === Shared Properties ===
+        vertex_t vertex_num;                    // Number of vertices in both graphs
+        index_t divisor;                        // Batch division factor for edge processing
+        long multiplier;                        // Hash key multiplier for edge mapping
+        
+        // === Heuristic Recovery System ===
+        index_t heuristic_sample_num;           // Number of edges needing heuristic recovery
+        vertex_t * heuristic_sample_nodes;      // Host: edges that need heuristic paths
+        vertex_t * heuristic_sample_nodes_device; // GPU: edges for heuristic processing
+        unordered_set<long> * added_edges;      // Track edges added during recovery
     
-        // input ext edges
-        index_t incremental_edge_num;
-        index_t incremental_sample_num;
-        index_t incremental_sample_ptr;
-        vertex_t * incremental_edges;
-        weight_t * incremental_weights;
-        index_t incremental_no_path_count;
-        // vertex_t * incremental_sample_nodes_device;
+        // === Incremental Edge Data (Currently Unused) ===
+        // Note: These fields are reserved for potential incremental functionality
+        index_t incremental_edge_num;           // Total incremental edges
+        index_t incremental_sample_num;         // Incremental edges per batch
+        index_t incremental_sample_ptr;         // Current position in incremental array
+        vertex_t * incremental_edges;           // Incremental edge endpoints
+        weight_t * incremental_weights;         // Incremental edge weights
+        index_t incremental_no_path_count;      // Count of incremental edges added
+
+        // === Decremental Edge Processing ===
+        index_t decremental_edge_num;           // Total edges to consider for removal
+        index_t decremental_sample_num;         // Edges per batch for processing
+        index_t decremental_sample_ptr;         // Current position in decremental array
+        vertex_t * decremental_edges;           // All edges to consider for removal
+        index_t filtered_del_sample_count;      // Edges that exist in sparse graph (need testing)
+        index_t decremental_no_path_count;      // Count of edges that couldn't be removed
+        vertex_t * filted_del_sample_edges;     // Host: filtered edges for current batch
+        vertex_t * decremental_sample_nodes_device; // GPU: current batch for random walks
 
 
-        // input del edges
-        index_t decremental_edge_num; // total number of del edges
-        index_t decremental_sample_num; // number of del edges in each iteration
-        index_t decremental_sample_ptr;
-        vertex_t * decremental_edges;
-        index_t filtered_del_sample_count;
-        index_t decremental_no_path_count;
-        vertex_t * filted_del_sample_edges;
-        vertex_t * decremental_sample_nodes_device; // size depend on the sample_num
+        // === Sparse Graph Properties (Target Sparsified Graph) ===
+        index_t sparse_edge_num;                // Current number of edges in sparse graph
+        index_t sparse_mtx_line_num;            // Number of original edge pairs in sparse graph
+        
+        // Sparse Graph Data Structures
+        weight_t * sparse_array_mtx;            // Flattened edge matrix representation
+        weight_t * sparse_array_ext;            // Extension edges for sparse graph
+        unordered_map<long, pair<index_t,index_t>> * sparse_map; // Edge mapping for O(1) operations
+        
+        // Sparse Graph CSR Data (Host)
+        vertex_t * sparse_degree_list;          // Current degrees (updated during edge removal)
+        vertex_t * sparse_degree_original;      // Original degrees (for memory layout)
+        weight_t ** sparse_beg_ptr;             // Pointers to neighbor data blocks
+        weight_t ** sparse_beg_ptr_device_content; // Device addresses for GPU pointers
+        weight_t * sparse_neighbors_data;       // Packed neighbor data
+        weight_t * sparse_extra_neighbors_data; // Space for dynamically added neighbors
+        
+        // Sparse Graph GPU Memory
+        vertex_t * sparse_degree_list_device;   // GPU copy of current degrees
+        vertex_t * sparse_degree_original_device; // GPU copy of original degrees
+        weight_t ** sparse_beg_ptr_device;      // GPU pointer array
+        weight_t * sparse_neighbors_data_device; // GPU neighbor data
+        weight_t * sparse_extra_neighbors_data_device; // GPU extra space
+        unsigned  sparse_extra_neighbor_offset; // Offset in extra space 
 
+        // === Dense Graph Properties (Updated Dense Graph for Pathfinding) ===
+        index_t dense_edge_num;                 // Current number of edges in dense graph
+        index_t dense_mtx_line_num;             // Number of original edge pairs in dense graph
+        
+        // Dense Graph Data Structures  
+        weight_t * dense_array_mtx;             // Flattened edge matrix representation
+        weight_t * dense_array_ext;             // Extension edges for dense graph
+        unordered_map<long, pair<index_t,index_t>> * dense_map; // Edge mapping for O(1) operations
+        
+        // Dense Graph CSR Data (Host)
+        vertex_t * dense_degree_list;           // Current degrees (updated during edge removal)
+        vertex_t * dense_degree_original;       // Original degrees (for memory layout)
+        weight_t ** dense_beg_ptr;              // Pointers to neighbor data blocks
+        weight_t ** dense_beg_ptr_device_content; // Device addresses for GPU pointers
+        weight_t * dense_neighbors_data;        // Packed neighbor data
+        weight_t * dense_extra_neighbors_data;  // Space for dynamically added neighbors
+        
+        // Dense Graph GPU Memory
+        vertex_t * dense_degree_list_device;    // GPU copy of current degrees
+        vertex_t * dense_degree_original_device; // GPU copy of original degrees
+        weight_t ** dense_beg_ptr_device;       // GPU pointer array
+        weight_t * dense_neighbors_data_device; // GPU neighbor data
+        weight_t * dense_extra_neighbors_data_device; // GPU extra space
+        unsigned  dense_extra_neighbor_offset;  // Offset in extra space
 
-        // sparse graph properties
-        index_t sparse_edge_num; 
-        index_t sparse_mtx_line_num;
-            // sparse mtx data
-            weight_t * sparse_array_mtx; // flattened
-            weight_t * sparse_array_ext;
-            unordered_map<long, pair<index_t,index_t>> * sparse_map;
-            //sparse CSR data
-            vertex_t * sparse_degree_list; // degree
-            vertex_t * sparse_degree_original; // fixed size in neighbors_data
-            weight_t ** sparse_beg_ptr; // begin pointer
-            weight_t ** sparse_beg_ptr_device_content;
-            weight_t * sparse_neighbors_data;
-            weight_t * sparse_extra_neighbors_data; 
-            // device pointers
-            vertex_t * sparse_degree_list_device;
-            vertex_t * sparse_degree_original_device;
-            weight_t ** sparse_beg_ptr_device;
-            weight_t * sparse_neighbors_data_device; 
-            weight_t * sparse_extra_neighbors_data_device;
-            unsigned  sparse_extra_neighbor_offset; 
-
-        // dense graph properties
-        index_t dense_edge_num;
-        index_t dense_mtx_line_num;
-            // dense mtx data
-            weight_t * dense_array_mtx; // flattened
-            weight_t * dense_array_ext;
-            unordered_map<long, pair<index_t,index_t>> * dense_map;
-            //dense CSR data
-            vertex_t * dense_degree_list; // degree     
-            vertex_t * dense_degree_original; // fixed size in neighbors_data
-            weight_t ** dense_beg_ptr; // begin pointer
-            weight_t ** dense_beg_ptr_device_content;
-            weight_t * dense_neighbors_data;
-            weight_t * dense_extra_neighbors_data; 
-            // device pointers
-            vertex_t * dense_degree_list_device;
-            vertex_t * dense_degree_original_device;
-            weight_t ** dense_beg_ptr_device;
-            weight_t * dense_neighbors_data_device; 
-            weight_t * dense_extra_neighbors_data_device; 
-            unsigned  dense_extra_neighbor_offset;
-
+        /**
+         * Constructor: Initialize Dual Graph System for Decremental Processing
+         * 
+         * Sets up both dense and sparse graph representations:
+         * - Dense graph: Updated dense graph with candidate edges already removed
+         * - Sparse graph: Target sparsification result with edge removal
+         * 
+         * Key Setup:
+         * - Edge mapping from both graphs for O(1) operations
+         * - GPU memory allocation for both graph structures
+         * - Batch processing configuration for decremental edges
+         * - Heuristic recovery system initialization
+         * 
+         * @param dense_ginst Updated dense graph (candidate edges already removed)
+         * @param sparse_ginst Initial sparse graph (edges will be removed from this)
+         */
         GPU_Dual_Graph(
             CSRGraph& dense_ginst, CSRGraph& sparse_ginst
         ){  
-            // TODO now this implementation for decremental only
+            // Note: Current implementation optimized for decremental processing
             // shared properties
             this->vertex_num = dense_ginst.vert_count;
             assert(dense_ginst.vert_count == sparse_ginst.vert_count);
@@ -243,11 +307,24 @@ class GPU_Dual_Graph{
 
         }
 
-        // remove edges based on the del edges and sample size
-        // update the filted_del_sample_edges
-        // update ptr
-        // copy the filted_del_sample_edges to device
-        // true means not empty
+        /**
+         * Core Decremental Operation: Remove edges and prepare next batch
+         * 
+         * This is the heart of the decremental sparsification algorithm:
+         * 
+         * 1. **Batch Processing**: Process next batch of candidate edges for removal
+         * 2. **Edge Removal**: Remove edges from both dense and sparse graphs using O(1) mapping
+         * 3. **Filtering**: Only include edges that exist in sparse graph for random walk testing
+         * 4. **Memory Management**: Update CSR structures efficiently using swap-to-end technique
+         * 5. **GPU Sync**: Transfer updated graph data and filtered batch to GPU
+         * 
+         * CSR Update Strategy:
+         * - Instead of shifting arrays, swap deleted edge with last edge
+         * - Decrement degree count to "hide" last position
+         * - Update edge mapping for swapped edges
+         * 
+         * @return true if more batches remain, false if processing complete
+         */
         bool removeAndUpdateDelEdges(){
 
             int count = 0;
@@ -411,6 +488,24 @@ class GPU_Dual_Graph{
             HRR(cudaMemcpy(dense_neighbors_data_device, dense_neighbors_data, sizeof(weight_t)*dense_edge_num*4 * 2, cudaMemcpyHostToDevice));
         }
 
+        /**
+         * Process random walk results and update sparse graph incrementally
+         * 
+         * After random walks complete, this method processes the results:
+         * 
+         * 1. **Path Found**: Reconstruct and add alternative path edges to sparse graph
+         * 2. **No Path**: Mark edge for heuristic recovery (essential for connectivity)
+         * 3. **Edge Recovery**: Add intermediate path edges to maintain connectivity
+         * 4. **Tracking**: Record all added edges for analysis and output
+         * 
+         * Key Logic: If random walk finds alternative path, the removed edge can be
+         * safely omitted from sparse graph since connectivity is preserved via the path.
+         * 
+         * @param path_selected Array of path vertices for each successful walk  
+         * @param path_selected_flag Array indicating if path was found (-1 if not)
+         * @param final_conductance Array of path conductance values
+         * @param n_steps Maximum steps per path
+         */
         void incrementalUpdateSparse(int* path_selected, int* path_selected_flag, float* final_conductance, int n_steps){
             int interval = n_steps;
             int count = 0;
@@ -463,6 +558,22 @@ class GPU_Dual_Graph{
             }
         }
 
+        /**
+         * Heuristic Recovery: Add essential edges using short random walks
+         * 
+         * For edges where no alternative paths were found during main processing,
+         * this method performs short random walks to find minimal connectivity paths:
+         * 
+         * 1. **Short Walks**: Perform multiple short (3-step) walks from each endpoint
+         * 2. **Path Addition**: Add all intermediate edges from successful walks
+         * 3. **Connectivity Insurance**: Ensures graph remains connected despite aggressive removal
+         * 
+         * This is a fallback mechanism to preserve essential connectivity when
+         * the main decremental algorithm cannot find alternative paths.
+         * 
+         * @param path_selected Array containing short walk paths
+         * @param n_walker Number of parallel walkers per endpoint
+         */
         void heuristicRecovery(int * path_selected, int n_walker){
             int steps = 3;
             int num = this->heuristic_sample_num;
@@ -574,25 +685,40 @@ class GPU_Dual_Graph{
 
         
 };
+/**
+ * CUDA Data Structure for Random Walk Computation (General Version)
+ * 
+ * Manages GPU memory and computation state for parallel random walk execution.
+ * This version includes full path reconstruction for detailed analysis.
+ * 
+ * Key Components:
+ * - Full path storage for reconstruction and analysis
+ * - Random number generation state (cuRAND) 
+ * - Path finding results and conductance computation
+ * - Shared memory arrays for GPU reduction operations
+ */
 class Random_walk_data{
 
     public:
-    int sample_num;
-    int n_steps;
-    int* path_selected; // selected path 
-	int* path_selected_device; 
-	int* path_selected_flag; // identify weather the path a found
-	int* path_selected_flag_device; 
-    float* conductance_shared_mem; // store the conductance of each thread for each path
-	int* conductance_index_shared_mem; // store thread index to perform reduction to find the maximum conductance
-    float* final_conductance; // store the final conductance of each path
-    float* final_conductance_device;
+    int sample_num;                         // Number of sample edges per batch
+    int n_steps;                            // Maximum steps per random walk
+    
+    // === Full Path Storage ===
+    int* path_selected;                     // Host: complete paths for reconstruction
+	int* path_selected_device;              // GPU: complete paths during computation
+	
+    // === Path Finding Results ===
+	int* path_selected_flag;                // Host: -1 if no path found, step count if found
+	int* path_selected_flag_device;         // GPU copy of path flags
+    
+    // === Conductance Computation Arrays ===
+    float* conductance_shared_mem;          // GPU shared memory for per-thread conductance values
+	int* conductance_index_shared_mem;      // GPU shared memory for thread indices (reduction)
+    float* final_conductance;               // Host: final conductance for each successful path
+    float* final_conductance_device;        // GPU copy of final conductance values
 
-    // int* no_path_flag; // identify whether the path is found, 
-    // int* no_path_flag_device;
-    // int* no_path_index; // for second round, identify the index of no path
-    // int* no_path_index_device;
-    curandState *global_state;
+    // === Random Number Generation ===
+    curandState *global_state;              // GPU: per-thread random number generator state
     
     Random_walk_data(
         int n_steps, 
@@ -647,19 +773,38 @@ class Random_walk_data{
 };
 
 
+/**
+ * CUDA Data Structure for Decremental Random Walk Computation
+ * 
+ * Optimized version for decremental processing with simplified path storage.
+ * Focuses on connectivity testing rather than detailed path analysis.
+ * 
+ * Key Differences from General Version:
+ * - Simplified path storage (no full reconstruction needed)
+ * - Optimized for connectivity testing rather than path analysis
+ * - Reduced memory footprint for large-scale decremental processing
+ */
 class Random_walk_data_decremental{
     public:
-    int sample_num;
-    int n_steps;
-    int* path_selected; // selected path 
-	int* path_selected_device; 
-	int* path_selected_flag; // identify weather the path a found
-	int* path_selected_flag_device; 
-    float* conductance_shared_mem; // store the conductance of each thread for each path
-	int* conductance_index_shared_mem; // store thread index to perform reduction to find the maximum conductance
-    float* final_conductance; // store the final conductance of each path
-    float* final_conductance_device;
-    curandState *global_state;
+    int sample_num;                         // Number of sample edges per batch
+    int n_steps;                            // Maximum steps per random walk
+    
+    // === Simplified Path Storage ===
+    int* path_selected;                     // Host: simplified path data for connectivity testing
+	int* path_selected_device;              // GPU: path data during computation
+	
+    // === Path Finding Results ===
+	int* path_selected_flag;                // Host: -1 if no path found, step count if found
+	int* path_selected_flag_device;         // GPU copy of path flags
+    
+    // === Conductance Computation Arrays ===
+    float* conductance_shared_mem;          // GPU shared memory for per-thread conductance values
+	int* conductance_index_shared_mem;      // GPU shared memory for thread indices (reduction)
+    float* final_conductance;               // Host: final conductance for each successful path
+    float* final_conductance_device;        // GPU copy of final conductance values
+    
+    // === Random Number Generation ===
+    curandState *global_state;              // GPU: per-thread random number generator state
 
     Random_walk_data_decremental(
         int n_steps, 
