@@ -2,3 +2,5 @@ dataset/
 del_edge/
 dataset_save/
 CLAUDE.md
+.claude/
+.vscode/

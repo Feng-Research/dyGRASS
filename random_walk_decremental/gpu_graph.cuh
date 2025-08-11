@@ -1,4 +1,4 @@
-/**
+ /**
  * GPU Graph Data Structures for dyGRASS Random Walk Decremental Processing
  * 
  * This header defines CUDA-optimized data structures for decremental graph sparsification:
@@ -116,7 +116,7 @@ class GPU_Dual_Graph{
         
         // Sparse Graph Data Structures
         weight_t * sparse_array_mtx;            // Flattened edge matrix representation
-        weight_t * sparse_array_ext;            // Extension edges for sparse graph
+        // weight_t * sparse_array_ext;            // Extension edges for sparse graph
         unordered_map<long, pair<index_t,index_t>> * sparse_map; // Edge mapping for O(1) operations
         
         // Sparse Graph CSR Data (Host)
@@ -141,7 +141,7 @@ class GPU_Dual_Graph{
         
         // Dense Graph Data Structures  
         weight_t * dense_array_mtx;             // Flattened edge matrix representation
-        weight_t * dense_array_ext;             // Extension edges for dense graph
+        // weight_t * dense_array_ext;             // Extension edges for dense graph
         unordered_map<long, pair<index_t,index_t>> * dense_map; // Edge mapping for O(1) operations
         
         // Dense Graph CSR Data (Host)
@@ -685,6 +685,7 @@ class GPU_Dual_Graph{
 
         
 };
+
 /**
  * CUDA Data Structure for Random Walk Computation (General Version)
  * 

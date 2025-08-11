@@ -560,118 +560,112 @@ CSRGraph::CSRGraph(const char* filename) {
     this->degree_list = this->degree.data();
 }
 
-/**
- * EdgeStream Constructor: Initialize streaming processing for dynamic edge batches
- * 
- * Sets up the stream processor but doesn't load any files yet.
- * Files are loaded on-demand using loadNextBatch().
- * 
- * Expected filename format: "stream_<index>_<operation>.mtx"
- * - index: sequence number (0, 1, 2, ...)
- * - operation: "insert" or "delete" 
- * 
- * @param folder Path to directory containing stream edge files
- * @param base Index base (0 or 1) for vertex IDs in files
- */
 EdgeStream::EdgeStream(const string& folder, int base) {
     this->base = base;
     this->operations_folder = folder;
-    this->current_batch_index = 0;
-    this->current_batch_edges = nullptr;
-    this->current_batch_size = 0;
-    this->current_op  = OperationType::INCREMENTAL;
+    this->batch_index = -1;
+    this->batch_size = 0;
+    this->current_op = OperationType::INCREMENTAL;
+    this->total_edges_processed = 0;
+    this->manual_selection = true;
     
     cout << "Initialized EdgeStream for folder: " << folder << " (base=" << base << ")" << endl;
     
-    // Verify directory exists
     DIR* dir = opendir(folder.c_str());
     if (dir == nullptr) {
         cout << "Error: Cannot open directory '" << folder << "'. "
              << "Reason: " << strerror(errno) << endl;
         exit(-1);
     }
-    closedir(dir);
     
-    cout << "EdgeStream ready for streaming processing." << endl;
-}
-
-/**
- * Load next batch of edges from stream files
- * 
- * Reads the next batch file in sequence, deallocates previous batch,
- * and allocates memory for the new batch.
- * 
- * @return true if batch loaded successfully, false if no more batches
- */
-bool EdgeStream::loadNextBatch() {
-    // Clean up previous batch
-    if (current_batch_edges != nullptr) {
-        delete[] current_batch_edges;
-        current_batch_edges = nullptr;
-        current_batch_size = 0;
-    }
-    
-    // Try both insert and delete operations for current index
-    string insert_filename = "stream_" + to_string(current_batch_index) + "_insert.mtx";
-    string delete_filename = "stream_" + to_string(current_batch_index) + "_delete.mtx";
-    
-    string insert_path = folder_path + "/" + insert_filename;
-    string delete_path = folder_path + "/" + delete_filename;
-    
-    string filepath;
-    StreamOperation::Type operation;
-    
-    // Check which file exists (try insert first, then delete)
-    if (access(insert_path.c_str(), F_OK) == 0) {
-        filepath = insert_path;
-        operation = StreamOperation::INSERT;
-    } else if (access(delete_path.c_str(), F_OK) == 0) {
-        filepath = delete_path;
-        operation = StreamOperation::DELETE;
-    } else {
-        // No more batches found
-        cout << "No more batch files found. Stream processing complete." << endl;
-        return false;
-    }
-    
-    cout << "Loading batch " << current_batch_index << ": " 
-         << (operation == StreamOperation::INSERT ? "INSERT" : "DELETE") 
-         << " (" << filepath << ")" << endl;
-    
-    // Store current operation
-    current_operation = operation;
-    
-    // Load edges from file
-    vector<tuple<vertex_t, vertex_t, weight_t>> temp_edges;
-    loadBatchFromFile(filepath, temp_edges);
-    
-    // Allocate array and copy edges
-    current_batch_size = temp_edges.size();
-    if (current_batch_size > 0) {
-        current_batch_edges = new tuple<vertex_t, vertex_t, weight_t>[current_batch_size];
-        for (size_t i = 0; i < current_batch_size; i++) {
-            current_batch_edges[i] = temp_edges[i];
+    struct dirent* entry;
+    while ((entry = readdir(dir)) != nullptr) {
+        string filename = entry->d_name;
+        
+        if (entry->d_type != DT_REG) continue;
+        
+        if (filename.find("stream_") == 0 && filename.find(".mtx") != string::npos) {
+            batch_names.push_back(filename);
         }
     }
     
-    cout << "Loaded " << current_batch_size << " edges for batch " << current_batch_index << endl;
+    closedir(dir);
     
-    // Move to next batch for subsequent calls
-    current_batch_index++;
+    sort(batch_names.begin(), batch_names.end());
+
+    cout << "Found " << batch_names.size() << " stream updates files: " << endl;
+    if (!batch_names.empty()) {
+        for (const string& filename : batch_names) {
+            cout << "  " << filename << endl;
+        }
+    }
+}
+
+bool EdgeStream::loadNextBatch() {
+    // Reset current batch state
+    this->batch_edges.clear();
+    int next_batch_index = this->batch_index + 1;
+    
+    // Check if we have more batches
+    if (next_batch_index >= batch_names.size()) {
+        cout << "No more stream files available." << endl;
+        return false;
+    }
+    
+    string next_batch_name = batch_names[next_batch_index];
+    string next_batch_path = this->operations_folder + "/" + next_batch_name;
+
+    cout << "Next stream file: " << next_batch_name << endl;
+
+    if (manual_selection) {
+        cout << "Load next stream file? (yes/yes_always/no): ";
+        string response;
+        cin >> response;
+        
+        if (response == "yes" || response == "y" || response == "Y") {
+            // Load this file only
+        } else if (response == "yes_always" || response == "ya" || response == "YA") {
+            // Load this file and disable manual selection for future
+            manual_selection = false;
+            cout << "Automatic loading enabled for remaining batches." << endl;
+        } else {
+            // User chose not to load
+            cout << "Skipping batch " << next_batch_index << endl;
+            return false;
+        }
+    }
+    
+    // Load the batch file
+    cout << "Loading: " << next_batch_path << endl;
+    
+    // Determine operation type from filename
+    if (next_batch_name.find("insert") != string::npos || next_batch_name.find("inc") != string::npos) {
+        this->current_op = OperationType::INCREMENTAL;
+    } else if (next_batch_name.find("delete") != string::npos || next_batch_name.find("dec") != string::npos) {
+        this->current_op = OperationType::DECREMENTAL;
+    }
+    
+    // Load edges from file into batch_edges vector
+    loadBatchFromFile(next_batch_path, current_op);
+    
+    // Update state
+    this->batch_index = next_batch_index;
+    this->batch_filename = next_batch_name;
+    this->batch_size = this->batch_edges.size();
+    this->total_edges_processed += this->batch_size;
+    
+    cout << "Loaded " << this->batch_size << " edges (" 
+         << (current_op == OperationType::INCREMENTAL ? "INSERT" : "DELETE") 
+         << ")" << endl;
     
     return true;
 }
 
-/**
- * Helper function to load edges from a specific batch file
- * 
- * @param filepath Path to MTX file containing edge batch
- * @param edges Output vector to store loaded edges
- */
-void EdgeStream::loadBatchFromFile(const string& filepath, vector<tuple<vertex_t, vertex_t, weight_t>>& edges) {
-    // Detect file format
-    GraphInfo info = auto_detect_graph_info(filepath.c_str());
-    
+
+
+void EdgeStream::loadBatchFromFile(const string& filepath, OperationType op) {
+
+    bool weightFlag = this->autoDetectWeightExist(filepath);
     // Open and map file
     int fd = open(filepath.c_str(), O_RDONLY);
     if (fd == -1) {
@@ -685,77 +679,116 @@ void EdgeStream::loadBatchFromFile(const string& filepath, vector<tuple<vertex_t
     assert(ss_head != MAP_FAILED);
     madvise(ss_head, file_size, MADV_SEQUENTIAL);
     
-    // Skip header lines
-    size_t head_offset = 0;
-    int skip_count = 0;
-    while (skip_count < info.skip_lines && head_offset < file_size) {
-        if (ss_head[head_offset++] == '\n') skip_count++;
-    }
-    
-    char* ss = ss_head + head_offset;
-    file_size -= head_offset;
-    
-    // Parse edges from file
+    char* ss = ss_head;
     size_t curr = 0, next = 0;
-    const size_t line_buffer_size = 256;
-    char* line_buffer = new char[line_buffer_size];
-    
+    int checkwt = 0;  // Counter for weight field parsing (src, dest, weight = 3 fields)
+    size_t edge_count = 0;
+
+    // PASS 1 count total edges in file
     while (next < file_size) {
-        // Parse source vertex
-        vertex_t src = atoi(ss + curr) - info.base;
-        
-        // Skip to destination field
+        if (weightFlag != 0) checkwt++;  // Track field position for weight parsing
+
+        // Skip current field
+        while (ss[next] != ' ' && ss[next] != '\n' && ss[next] != '\t') next++;
+        while (ss[next] == ' ' || ss[next] == '\n' || ss[next] == '\t') next++;
+        // curr = next;
+
+        if (checkwt != 3) edge_count++;  // Count edges (ignore weight fields)
+        if (checkwt == 3) checkwt = 0;   // Reset after processing weight
+    }
+
+    edge_count = edge_count >> 1;
+    this->batch_edges.resize(edge_count);   // Create edge_count elements for direct indexing
+
+    // PASS 2: Parse and arrange edges in batch layout
+    vertex_t source, dest;
+    size_t offset = 0;  // Current edge being processed
+    curr = 0;
+    next = 0;
+    weight_t wtvalue;
+
+    while (offset < edge_count) {
+        // Parse source vertex (convert from 1-based to 0-based)
+        char* sss = ss + curr;
+        source = atoi(sss) - this->base; // Convert from 1-based to 0-based indexing
+
+        // Jump to destination field
         while (ss[next] != ' ' && ss[next] != '\n' && ss[next] != '\t') next++;
         while (ss[next] == ' ' || ss[next] == '\n' || ss[next] == '\t') next++;
         curr = next;
         
-        // Parse destination vertex
-        vertex_t dest = atoi(ss + curr) - info.base;
+        // Parse destination vertex (convert from 1-based to 0-based)
+        char* sss1 = ss + curr;
+        dest = atoi(sss1) - this->base; // Convert from 1-based to 0-based indexing
+
+        // Skip to weight field (if present)
+        while (ss[next] != ' ' && ss[next] != '\n' && ss[next] != '\t') next++;
+        while (ss[next] == ' ' || ss[next] == '\n' || ss[next] == '\t') next++;
         
         // Parse weight if present
-        weight_t weight = 1.0; // Default weight
-        if (info.is_weighted) {
-            // Skip to weight field
+        if (weightFlag != 0) {
+            curr = next;
+            char* sss1 = ss + curr;
+            wtvalue = atof(sss1);
+
             while (ss[next] != ' ' && ss[next] != '\n' && ss[next] != '\t') next++;
             while (ss[next] == ' ' || ss[next] == '\n' || ss[next] == '\t') next++;
-            curr = next;
-            
-            weight = atof(ss + curr);
-            
-            // Handle Laplacian matrix format
-            if (info.is_laplacian && src != dest) {
-                weight = -weight; // Make negative weights positive
-            }
         }
-        
-        // Skip to next line
-        while (ss[next] != ' ' && ss[next] != '\n' && ss[next] != '\t') next++;
-        while (ss[next] == ' ' || ss[next] == '\n' || ss[next] == '\t') next++;
+        else{
+            wtvalue = 1.0;  // Default weight
+        }
         curr = next;
-        
-        // Skip diagonal entries in Laplacian matrices
-        if (info.is_laplacian && src == dest) {
-            continue;
-        }
-        
-        // Store edge (convert to specified base)
-        edges.push_back(make_tuple(src + this->base, dest + this->base, weight));
+
+        batch_edges[offset] = make_tuple(source, dest, wtvalue);  // Store edge tuple
+
+        offset++;
     }
-    
-    // Cleanup
-    delete[] line_buffer;
-    munmap(ss_head, file_size + head_offset);
+
+    // Clean up memory mapping
+    munmap(ss_head, file_size);
     close(fd);
 }
 
-/**
- * EdgeStream Destructor: Clean up allocated memory
- */
-EdgeStream::~EdgeStream() {
-    if (current_batch_edges != nullptr) {
-        delete[] current_batch_edges;
-        current_batch_edges = nullptr;
+bool EdgeStream::autoDetectWeightExist(const string& filename) {
+    ifstream file(filename);
+    if (!file.is_open()) {
+        cout << "Error: Cannot open file '" << filename << "' for weight detection." << endl;
+        exit(-1);
     }
+    
+    string line;
+    if (!getline(file, line)) {
+        cout << "Error: Cannot read first line from file '" << filename << "'." << endl;
+        file.close();
+        exit(-1);
+    }
+    
+    file.close();
+    
+    // Check for comment line
+    if (!line.empty() && line[0] == '%') {
+        cout << "Error: Comment lines not supported in batch files. Found: " << line << endl;
+        exit(-1);
+    }
+    
+    // Try to parse elements
+    double num1, num2, num3;
+    int parsed = sscanf(line.c_str(), "%lf %lf %lf", &num1, &num2, &num3);
+    
+    if (parsed == 3) {
+        return true;  // Edge weights exist
+    } else if (parsed == 2) {
+        return false; // No edge weights
+    } else {
+        cout << "Error: Invalid line format. Expected 2 or 3 numbers, got " << parsed << " numbers." << endl;
+        cout << "First line content: '" << line << "'" << endl;
+        exit(-1);
+    }
+}
+
+
+EdgeStream::~EdgeStream() {
+
     cout << "EdgeStream cleanup complete." << endl;
 }
 

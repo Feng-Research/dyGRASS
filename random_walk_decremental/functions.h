@@ -87,9 +87,9 @@ class CSRGraph {
         vector<weight_t> weight;     // Edge weights corresponding to adj entries
         vector<index_t> begin;       // Starting index in adj[] for each vertex
         vector<index_t> degree;      // Number of neighbors for each vertex
-        vector<vertex_t> from;       // Original edge index mapping
-        vector<vertex_t> reverse;    // Reverse edge position mapping
-        vector<tuple<vertex_t, vertex_t, weight_t>> mtx; // Original edge tuples
+        vector<vertex_t> from;       // Original edge index from MTX file
+        vector<vertex_t> reverse;    // Reverse edge lookup for undirected graphs
+        vector<tuple<vertex_t, vertex_t, weight_t>> mtx; // Original edge list format
         
         // === Edge Deletion Support ===
         unordered_map<long, pair<index_t,index_t>> edge_map; // (src,dest) -> (pos1,pos2) for O(1) deletion
@@ -173,12 +173,6 @@ class CSRGraph {
      */
     void read_targets(const char* filename, int process_line, int weightFlag, int divisor);
 
-    /**
-     * Remove edges from graph based on target edge results
-     * Core decremental operation: removes edges when random walks
-     * find alternative paths, preserving only necessary edges.
-     */
-    void remove_edge_from_targets();
 
 
 };

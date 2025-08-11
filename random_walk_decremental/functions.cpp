@@ -120,7 +120,7 @@ CSRGraph::CSRGraph(const char* filename, bool is_reverse, long skip_head, int we
     this->line_count = edge_count>>1;  // Divide by 2 since each line has src->dest pair
     // Edge count depends on whether we're creating undirected graph (with reverse edges)
     this->edge_count = is_reverse ? edge_count : edge_count>>1;
-    this->vert_count = v_max + 1;  // Vertex count based on max ID (0-indexed)
+    this->vert_count = v_max;
     this->v_max = v_max;
     this->v_min = v_min;
     
@@ -280,26 +280,6 @@ CSRGraph::CSRGraph(const char* filename, bool is_reverse, long skip_head, int we
     this->degree_list = this->degree.data();
 }
 
-/**
- * Remove edges from graph based on random walk results
- * 
- * Core decremental sparsification operation:
- * - Removes edges when random walks find alternative connecting paths
- * - Preserves edges when no alternative paths exist (maintains connectivity)
- * - Uses edge mapping for efficient O(1) edge deletion
- * 
- * This method is called after random walk processing to update
- * the graph structure based on sparsification results.
- * 
- * TODO: Implement edge removal logic based on random walk path finding results
- * Currently placeholder - actual implementation depends on random walk results format
- */
-void CSRGraph::remove_edge_from_targets(){
-    // Implementation pending - will process random walk results and
-    // remove edges where alternative paths were found
-}
-
-
 
 /**
  * Read target edges for decremental processing with batch organization
@@ -348,7 +328,7 @@ void CSRGraph::read_targets(const char* filename, int process_line, int weightFl
         // Skip current field
         while (ss[next] != ' ' && ss[next] != '\n' && ss[next] != '\t') next++;
         while (ss[next] == ' ' || ss[next] == '\n' || ss[next] == '\t') next++;
-        curr = next;
+        // curr = next;
 
         if (checkwt != 3) edge_count++;  // Count edges (ignore weight fields)
         if (checkwt == 3) checkwt = 0;   // Reset after processing weight

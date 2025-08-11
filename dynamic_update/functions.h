@@ -48,25 +48,6 @@ enum OperationType {
 };
 
 
-struct Targets {
-    vertex_t* nodes;     // Array layout: [src1,src2,...,tgt1,tgt2,...]
-    weight_t* weights;   // Corresponding edge weights
-    size_t target_count; // Number of edges to process
-
-    /**
-     * Constructor: Initialize empty targets
-     */
-    Targets() : nodes(nullptr), weights(nullptr), target_count(0) {}
-
-    /**
-     * Destructor: Clean up allocated memory
-     */
-    ~Targets() {
-        delete[] nodes;
-        delete[] weights;
-        cout <<"Targets deleted" << endl;
-    }
-};
 
 struct GraphInfo {
       long skip_lines;
@@ -157,162 +138,41 @@ class CSRGraph {
 
 };
 
-/**
- * @struct BatchOperation
- * @brief Represents a single batch operation in the dynamic edge flow
- * 
- * Each batch operation contains a set of edges to be processed together
- * for either incremental (addition) or decremental (removal) sparsification.
- */
-struct BatchOperation {
-    int index;                    // Sequential batch index (0, 1, 2, ...)
-    OperationType operation_type; // INCREMENTAL or DECREMENTAL
-    string filename;              // Path to batch file
-    size_t edge_count;           // Number of edges in this batch
-    
-    // Loaded edge data (organized for GPU processing)
-    vertex_t* edges;             // Edge endpoints [src1,src2,...,dest1,dest2,...]
-    weight_t* weights;           // Corresponding edge weights
-    
-    BatchOperation() : index(-1), operation_type(INCREMENTAL), edge_count(0), 
-                      edges(nullptr), weights(nullptr) {}
-    
-    BatchOperation(int idx, OperationType op_type, const string& file) 
-        : index(idx), operation_type(op_type), filename(file), edge_count(0),
-          edges(nullptr), weights(nullptr) {}
-    
-    ~BatchOperation() {
-        delete[] edges;
-        delete[] weights;
-    }
-};
 
-/**
- * @class EdgeStream
- * @brief Manages dynamic edge flow processing for both incremental and decremental operations
- * 
- * This class handles the file-based batch processing system for dynamic graph updates:
- * - Discovers and organizes batch operation files
- * - Loads edges from batch files in the correct format
- * - Manages the sequence of operations for reproducible experiments
- * - Provides interactive control over execution flow
- * 
- * Key Features:
- * - File naming convention: XX_inc_batch.mtx, XX_dec_batch.mtx
- * - Sequential processing with user control
- * - Memory efficient batch loading
- * - GPU-ready data organization
- */
 class EdgeStream {
     public:
     int base;
 
     string operations_folder; 
-    size_t batch_number;
-    size_t current_batch_index;                // Current position in sequence
-    size_t current_batch_size;
-    BatchOperation * current_batch_edges; // Pointer to current batch edges
-    OperationType current_op;
+    vector<string> batch_names;
+    size_t batch_index;                // Current position in sequence
+    size_t batch_size;
+    string batch_filename;
+    vector<tuple<vertex_t, vertex_t, weight_t>> batch_edges; // Reference to current batch edges
 
-    
-    // === Statistics ===
+    OperationType current_op;
     size_t total_edges_processed;             // Running count of processed edges
     vector<size_t> batch_sizes;               // Edge count per batch for analysis
+    bool manual_selection;
     
-    // === Constructors and Destructor ===
     
-    /**
-     * Default constructor
-     */
-    EdgeStream() : current_batch_index(0), 
-                   total_edges_processed(0) {}
-    
-    /**
-     * Constructor with folder path
-     * @param folder Path to directory containing batch files
-     */
     EdgeStream(const string& folder, int base);
     
-    /**
-     * Destructor: Clean up resources
-     */
+
     ~EdgeStream() {
         cout << "EdgeStream deleted. Processed " << total_edges_processed << " total edges." << endl;
     }
     
-    // === Core Functionality ===
 
-    
-    /**
-     * Load next batch operation from sequence
-     * @return Pointer to loaded batch operation, nullptr if sequence complete
-     */
-    BatchOperation* load_next_batch();
-    
-    /**
-     * Load specific batch by index
-     * @param index Batch index to load
-     * @return Pointer to loaded batch operation, nullptr if invalid index
-     */
-    BatchOperation* load_batch(size_t index);
-    
-    /**
-     * Check if more batches remain in sequence
-     * @return true if more batches available
-     */
-    bool has_next_batch() const { return current_batch_index < operation_sequence.size(); }
-    
-    /**
-     * Get current batch progress information
-     * @return pair<current_index, total_batches>
-     */
-    pair<size_t, size_t> get_progress() const { 
-        return make_pair(current_batch_index, operation_sequence.size()); 
-    }
+    bool loadNextBatch();
+
+    bool autoDetectWeightExist(const string& filename);
+
+    void loadBatchFromFile(const string& filename, OperationType op);
     
 
-    
-    // === File Operations ===
-    
-    /**
-     * Parse batch filename to extract index and operation type
-     * @param filename Batch filename (e.g., "05_inc_batch.mtx")
-     * @param index Output: extracted index
-     * @param op_type Output: extracted operation type
-     * @return true if parsing successful
-     */
-    bool parse_batch_filename(const string& filename, int& index, OperationType& op_type);
-    
-    /**
-     * Load edges from batch file into GPU-ready format
-     * @param batch Batch operation to populate with edge data
-     * @return true if loading successful
-     */
-    bool load_batch_edges(BatchOperation& batch);
-    
-    /**
-     * Count edges in batch file
-     * @param filename Path to batch file
-     * @return Number of edges in file
-     */
-    size_t count_edges_in_file(const string& filename);
-    
-    // === Utility Functions ===
-    
-    /**
-     * Print current stream statistics
-     */
-    void print_statistics() const;
-    
-    /**
-     * Validate batch file format and accessibility
-     * @param filename Path to batch file
-     * @return true if file is valid and accessible
-     */
-    bool validate_batch_file(const string& filename);
 };
 
-// === Standalone Functions for Compatibility ===
 
 
 GraphInfo auto_detect_graph_info(const char* filename);
