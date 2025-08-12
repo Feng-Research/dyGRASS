@@ -48,6 +48,8 @@ enum OperationType {
 };
 
 
+#define max_steps 100
+
 
 struct GraphInfo {
       long skip_lines;

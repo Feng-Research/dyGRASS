@@ -38,29 +38,99 @@ static void HandleError( cudaError_t err,
 class GPU_Stream_Edges{
     private:
         size_t max_capacity;
+        bool overflow_flag;
+        size_t  next_run_index;
+       
+
     public:
+        int n_steps;
         size_t batch_size;
+        size_t load_size;
         vertex_t * edges;
         weight_t * weights;
+        int * path_selected; // selected path
+        int * path_selected_flag; // path exist?
 
+
+        // Device memory
         vertex_t *edges_device;
         weight_t *weights_device;
+        int *path_selected_device;
+        int *path_selected_flag_device;
+
+        //reduction calculation
+        float * resistance_shared_mem;
+        float * resistance_index_shared_mem;
+
+        //Others
+        OperationType current_op;
 
         
 
-        GPU_Stream_Edges(size_t max_capacity){
+        GPU_Stream_Edges(size_t max_capacity, int n_steps){
+            this->n_steps = n_steps;
             this->max_capacity = max_capacity;
+            this->overflow_flag = false;
+            this->next_run_index = 0;
+            this->load_size = 0;
             this->batch_size = 0;
-            this->edges = new vertex_t[max_capacity * 2];
-            this->weights = new weight_t[max_capacity];
+            this->current_op = INCREMENTAL;
+            this->edges = nullptr;
+            this->weights = nullptr;
 
             HRR(cudaMalloc((void **)&edges_device, sizeof(vertex_t)*max_capacity * 2));
             HRR(cudaMalloc((void **)&weights_device, sizeof(weight_t)*max_capacity));
         }
 
-        void ensureCapacity(){
+        void loadEdgeFromStream(const EdgeStream& edge_stream){
+
+            this->batch_size = edge_stream.batch_size;
+            assert(batch_size == edge_stream.batch_edges.size());
+            this->current_op = edge_stream.current_op;
+
+            if (this->edges != nullptr && this->weights != nullptr){
+                delete[] this->edges;
+                delete[] this->weights;
+            }
+
+            this->edges = new vertex_t[batch_size * 2];
+            this->weights = new weight_t[batch_size];
+
+            for (size_t i = 0; i < batch_size; i++){
+                auto [src, dst, weight] = edge_stream.batch_edges[i];
+                this->edges[i * 2] = src;
+                this->edges[i * 2 + 1] = dst;
+                this->weights[i] = weight;
+            }
 
         }
+
+        void loadEdgesToDevice(){
+            if (this->edges == nullptr || this->weights == nullptr){
+                cout << "Error: edges or weights not loaded." << endl;
+                error("Edges not loaded to GPU stream.");
+                return;
+            }
+
+            if (this->batch_size - this->next_run_index > this->max_capacity){
+
+                this->overflow_flag = true;
+                this->load_size = this->max_capacity;
+                this->next_run_index += this->max_capacity;
+                
+            }
+            else{
+
+                this->overflow_flag = false;
+                this->load_size = this->batch_size - this->next_run_index;  
+                this->next_run_index = 0; // reset for next batch
+            }
+
+            HRR(cudaMemcpy(edges_device, edges + (next_run_index * 2), sizeof(vertex_t) * load_size * 2, cudaMemcpyHostToDevice));
+            HRR(cudaMemcpy(weights_device, weights + next_run_index, sizeof(weight_t) * load_size, cudaMemcpyHostToDevice));
+
+        }
+
 
         ~GPU_Stream_Edges(){
             delete[] edges;
