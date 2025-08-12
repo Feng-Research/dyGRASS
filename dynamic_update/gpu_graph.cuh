@@ -82,7 +82,7 @@ class GPU_Stream_Edges{
             HRR(cudaMalloc((void **)&weights_device, sizeof(weight_t)*max_capacity));
         }
 
-        void loadEdgeFromStream(const EdgeStream& edge_stream){
+        void loadEdgeFromStream(const EdgeStream& edge_stream, const GPU_Dual_Graph& dual_graph){
 
             this->batch_size = edge_stream.batch_size;
             assert(batch_size == edge_stream.batch_edges.size());
@@ -98,6 +98,10 @@ class GPU_Stream_Edges{
 
             for (size_t i = 0; i < batch_size; i++){
                 auto [src, dst, weight] = edge_stream.batch_edges[i];
+
+                if(current_op == INCREMENTAL){}
+
+
                 this->edges[i * 2] = src;
                 this->edges[i * 2 + 1] = dst;
                 this->weights[i] = weight;
@@ -153,6 +157,7 @@ class GPU_Dual_Graph{
         //incremental
         float distortion;
         //decremental
+        index_t * wait_add_edges;
 
         // === Sparse Graph Properties (Target Sparsified Graph) ===
         index_t sparse_edge_num;                // Current number of edges in sparse graph
@@ -260,7 +265,32 @@ class GPU_Dual_Graph{
 
         }
 
-        void IncrementalUpdateFilteredEdges(
+
+
+        bool edge_exists(vertex_t u, vertex_t v, bool check_sparsifier){
+            if (u > v) swap(u, v);
+            long key = u * this->multiplier + v;;
+
+            if (check_sparsifier) {
+                // Check in the sparsifier
+                return this->sparse_map->count(key) > 0;
+            }
+            // Check in the original graph
+            return this->dense_map->count(key) > 0;
+        }
+
+        
+        void edgeDeletion(GPU_Stream_Edges & stream_edges){
+            if (stream_edges.current_op != DECREMENTAL) {
+                cout << "Error: edgeDeletion called with non-decremental operation." << endl;
+                return;
+            }
+
+
+
+
+        }
+        void edgeInsertion(
             int* path_selected_flag, 
             float* final_conductance,
             int edge
