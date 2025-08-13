@@ -35,6 +35,10 @@ static void HandleError( cudaError_t err,
 // Macro for convenient error checking: H_ERR(cudaMalloc(...))
 #define H_ERR( err )(HandleError( err, __FILE__, __LINE__ ))
 
+
+# define DENSE 0
+# define SPARSE 1
+
 class GPU_Stream_Edges{
     private:
         size_t max_capacity;
@@ -58,9 +62,14 @@ class GPU_Stream_Edges{
         int *path_selected_device;
         int *path_selected_flag_device;
 
+
+        //heursistic recovery
+        index_t heuristic_sample_num;
+        vertex_t * heuristic_sample_nodes;      // Host: edges that need heuristic paths
+        vertex_t * heuristic_sample_nodes_device; // GPU: edges for heuristic processing
+
         //reduction calculation
-        float * resistance_shared_mem;
-        float * resistance_index_shared_mem;
+        //TODO: try reduction without global memory
 
         //Others
         OperationType current_op;
@@ -77,12 +86,18 @@ class GPU_Stream_Edges{
             this->current_op = INCREMENTAL;
             this->edges = nullptr;
             this->weights = nullptr;
+            this->path_selected = new int[max_capacity * n_steps];
+            this->path_selected_flag = new int[max_capacity];
 
             HRR(cudaMalloc((void **)&edges_device, sizeof(vertex_t)*max_capacity * 2));
             HRR(cudaMalloc((void **)&weights_device, sizeof(weight_t)*max_capacity));
+
+            HRR(cudaMalloc((void **)&path_selected_device, sizeof(int)*max_capacity * n_steps));
+            HRR(cudaMalloc((void **)&path_selected_flag_device, sizeof(int)*max_capacity));
+
         }
 
-        void loadEdgeFromStream(const EdgeStream& edge_stream, const GPU_Dual_Graph& dual_graph){
+        void loadEdgeFromStream(const EdgeStream& edge_stream){
 
             this->batch_size = edge_stream.batch_size;
             assert(batch_size == edge_stream.batch_edges.size());
@@ -99,8 +114,6 @@ class GPU_Stream_Edges{
             for (size_t i = 0; i < batch_size; i++){
                 auto [src, dst, weight] = edge_stream.batch_edges[i];
 
-                if(current_op == INCREMENTAL){}
-
 
                 this->edges[i * 2] = src;
                 this->edges[i * 2 + 1] = dst;
@@ -112,7 +125,8 @@ class GPU_Stream_Edges{
         void loadEdgesToDevice(){
             if (this->edges == nullptr || this->weights == nullptr){
                 cout << "Error: edges or weights not loaded." << endl;
-                error("Edges not loaded to GPU stream.");
+                std::cerr << "Edges not loaded to GPU stream." << std::endl;
+                exit(EXIT_FAILURE);
                 return;
             }
 
@@ -131,17 +145,30 @@ class GPU_Stream_Edges{
             }
 
             HRR(cudaMemcpy(edges_device, edges + (next_run_index * 2), sizeof(vertex_t) * load_size * 2, cudaMemcpyHostToDevice));
-            HRR(cudaMemcpy(weights_device, weights + next_run_index, sizeof(weight_t) * load_size, cudaMemcpyHostToDevice));
+            if (this->current_op == INCREMENTAL){
+                HRR(cudaMemcpy(weights_device, weights + next_run_index, sizeof(weight_t) * load_size, cudaMemcpyHostToDevice));
+            }
 
+        }
+
+        void downloadResult(){
+            if (this->current_op == DECREMENTAL){
+                HRR(cudaMemcpy(path_selected, path_selected_device, sizeof(int) * load_size * n_steps, cudaMemcpyDeviceToHost));
+            }
+            HRR(cudaMemcpy(path_selected_flag, path_selected_flag_device, sizeof(int) * load_size, cudaMemcpyDeviceToHost));
         }
 
 
         ~GPU_Stream_Edges(){
             delete[] edges;
             delete[] weights;
+            delete[] path_selected;
+            delete[] path_selected_flag;
 
             cudaFree(edges_device);
             cudaFree(weights_device);
+            cudaFree(path_selected_device);
+            cudaFree(path_selected_flag_device);
             cout << "GPU_Stream_Edges deallocated" << endl;
         }
 
@@ -151,110 +178,97 @@ class GPU_Dual_Graph{
 
     public:
         // === Shared Properties ===
+        CSRGraph * graphs[2];
         vertex_t vertex_num;                    // Number of vertices in both graphs
         long multiplier;                        // Hash key multiplier for edge mapping
         
         //incremental
-        float distortion;
         //decremental
         index_t * wait_add_edges;
 
-        // === Sparse Graph Properties (Target Sparsified Graph) ===
-        index_t sparse_edge_num;                // Current number of edges in sparse graph
-        unordered_map<long, pair<index_t,index_t>> * sparse_map; // Edge mapping for O(1) operations
-        
-        // Sparse Graph CSR Data (Host)
-        vertex_t * sparse_degree_list;          // Current degrees (updated during edge removal)
-        vertex_t * sparse_degree_original;      // Original degrees (for memory layout)
-        weight_t ** sparse_beg_ptr;             // Pointers to neighbor data blocks
-        weight_t ** sparse_beg_ptr_device_content; // Device addresses for GPU pointers
-        weight_t * sparse_neighbors_data;       // Packed neighbor data (adj and weights/resistance)
+        // try new thing
+        index_t edge_num[2];
+        unordered_map<long, pair<index_t,index_t>> * graph_map[2]; // Edge mapping for O(1) operations
+        vertex_t * degree_list[2];          // Current degrees (updated during edge removal)
+        vertex_t * bin_size[2];              // Original degrees (for memory layout)
+        weight_t ** beg_ptr[2];             // Pointers to neighbor data blocks
+        weight_t ** beg_ptr_device_content[2]; // Device addresses for GPU pointers
+        weight_t * concatenated_neighbors_data[2]; // Concatenated neighbor data
+        weight_t * extra_neighbor_data[2];       // Extra neighbor data for dynamic updates
 
-        
-        // Sparse Graph GPU Memory
-        vertex_t * sparse_degree_list_device;   // GPU copy of current degrees
-        vertex_t * sparse_degree_original_device; // GPU copy of original degrees
-        weight_t ** sparse_beg_ptr_device;      // GPU pointer array
-        weight_t * sparse_neighbors_data_device; // GPU neighbor data
-        unsigned  sparse_extra_neighbor_offset; // Offset in extra space 
+        vertex_t * degree_list_device[2];   // GPU copy of current degrees
+        vertex_t * bin_size_device[2];       // GPU copy of original degrees
+        weight_t ** beg_ptr_device[2];       // GPU pointer array
+        weight_t * concatenated_neighbors_data_device[2]; // GPU neighbor data
+        weight_t * extra_neighbor_data_device[2];       // GPU extra neighbor data
 
-        // === Dense Graph Properties (Updated Dense Graph for Pathfinding) ===
-        index_t dense_edge_num;                 // Current number of edges in dense graph
-        unordered_map<long, pair<index_t,index_t>> * dense_map; // Edge mapping for O(1) operations
-        
-        // Dense Graph CSR Data (Host)
-        vertex_t * dense_degree_list;           // Current degrees (updated during edge removal)
-        vertex_t * dense_degree_original;       // Original degrees (for memory layout)
-        weight_t ** dense_beg_ptr;              // Pointers to neighbor data blocks
-        weight_t ** dense_beg_ptr_device_content; // Device addresses for GPU pointers
-        weight_t * dense_neighbors_data;        // Packed neighbor data
-        
-        // Dense Graph GPU Memory
-        vertex_t * dense_degree_list_device;    // GPU copy of current degrees
-        vertex_t * dense_degree_original_device; // GPU copy of original degrees
-        weight_t ** dense_beg_ptr_device;       // GPU pointer array
-        weight_t * dense_neighbors_data_device; // GPU neighbor data
-        unsigned  dense_extra_neighbor_offset;  // Offset in extra space
+        unsigned extra_neighbor_offset[2];
 
 
         GPU_Dual_Graph(
-            CSRGraph& dense_ginst, CSRGraph& sparse_ginst
+            CSRGraph* dense_ginst, CSRGraph* sparse_ginst
         ){  
-            // Note: Current implementation optimized for decremental processing
-            // shared properties
-            this->vertex_num = dense_ginst.vert_count;
-            assert(dense_ginst.vert_count == sparse_ginst.vert_count);
+            this->graphs[DENSE] = dense_ginst;
+            this->graphs[SPARSE] = sparse_ginst;
 
-            this->multiplier = sparse_ginst.multiplier;
-            assert(sparse_ginst.multiplier == dense_ginst.multiplier);
-            this->sparse_map = &sparse_ginst.edge_map; // don't deallocate this
+            assert(graphs[DENSE]->vert_count == graphs[SPARSE]->vert_count);
+            this->vertex_num = graphs[DENSE]->vert_count;
 
+            assert(graphs[DENSE]->multiplier == graphs[SPARSE]->multiplier);
+            this->multiplier = graphs[SPARSE]->multiplier;
 
+            for (int graph_type = 0; graph_type < 2 ; graph_type++){
+                
+                this->edge_num[graph_type] = graphs[graph_type]->edge_count;
+                this->graph_map[graph_type] = &graphs[graph_type]->edge_map; // don't deallocate this
+                this->degree_list[graph_type] = graphs[graph_type]->degree_list; // don't deallocate this
+                this->bin_size[graph_type] = new vertex_t[vertex_num];
 
-            // dense graph properties
-            this->dense_edge_num = dense_ginst.edge_count;
-            this->dense_map = &dense_ginst.edge_map; // don't deallocate this
-            this->dense_degree_list = dense_ginst.degree_list; // don't deallocate this
-            this->dense_degree_original = new vertex_t[vertex_num];
-            for (int i = 0; i < vertex_num; i++){
-                dense_degree_original[i] = dense_ginst.degree[i];
+                for (int i = 0; i < vertex_num; i++){
+                    this->bin_size[graph_type][i] = graphs[graph_type]->degree_list[i];
+                }
+                auto[beg_ptr, neighbors_data] = createNeighborArray(graphs[graph_type]);
+                this->beg_ptr[graph_type] = beg_ptr;
+                this->concatenated_neighbors_data[graph_type] = neighbors_data;
+                this->beg_ptr_device_content[graph_type] = new weight_t*[vertex_num]; // store device pointers
+
+                HRR(cudaMalloc((void **)&degree_list_device[graph_type], sizeof(vertex_t)*vertex_num));
+                HRR(cudaMalloc((void **)&bin_size_device[graph_type], sizeof(vertex_t)*vertex_num));
+                HRR(cudaMalloc((void ***)&beg_ptr_device[graph_type], sizeof(weight_t*)*vertex_num));
+                HRR(cudaMalloc((void **)&concatenated_neighbors_data_device[graph_type], sizeof(weight_t)*edge_num[graph_type]*2 * 2));
+                int offset = 0;
+                for (int i = 0; i < vertex_num; i++){
+                    beg_ptr_device_content[graph_type][i] = concatenated_neighbors_data_device[graph_type] + offset;
+                    offset += degree_list[graph_type][i]*2;
+                }
+
+                this->extra_neighbor_data[graph_type] = this->concatenated_neighbors_data[graph_type] + this->edge_num[graph_type]*2;
+                this->extra_neighbor_data_device[graph_type] = this->concatenated_neighbors_data_device[graph_type] + offset;
+                assert(extra_neighbor_data_device == concatenated_neighbors_data_device + this->edge_num[graph_type]*2);
+                this->extra_neighbor_offset[graph_type] = 0;
+
+                
             }
-            auto[beg_ptr, neighbors_data] = createNeighborArray(dense_ginst);
-            this->dense_beg_ptr = beg_ptr;
-            this->dense_beg_ptr_device_content = new weight_t*[vertex_num]; // store device pointers
-            this->dense_neighbors_data = neighbors_data;
-
-            HRR(cudaMalloc((void **)&dense_degree_list_device, sizeof(vertex_t)*vertex_num));
-            HRR(cudaMalloc((void **)&dense_degree_original_device, sizeof(vertex_t)*vertex_num));
-            HRR(cudaMalloc((void ***)&dense_beg_ptr_device, sizeof(weight_t*)*vertex_num));
-            HRR(cudaMalloc((void **)&dense_neighbors_data_device, sizeof(weight_t)*dense_edge_num*2 * 2));
-            // dense_extra_neighbors_data_device = dense_neighbors_data_device + dense_edge_num*4;
-            int offset = 0;
-            for (int i = 0; i < vertex_num; i++){
-                // weight_t * ptr = dense_neighbors_data_device + offset;
-                // dense_beg_ptr_device_content[i] = reinterpret_cast<weight_t*>(ptr);
-                dense_beg_ptr_device_content[i] = dense_neighbors_data_device + offset;
-                offset += dense_degree_original[i]*2;
-            }
-
+            // copy to GPU
+            this->updateDeviceDualGraph();
 
         }
         
 
-        tuple<weight_t**, weight_t*> createNeighborArray(const CSRGraph& graph) {
+        tuple<weight_t**, weight_t*> createNeighborArray(const CSRGraph * graph) {
             // Allocate an array of pointers, one for each vertex
-            weight_t** beg_ptr = new weight_t* [graph.vert_count];
+            weight_t** beg_ptr = new weight_t* [this->vertex_num];
 
-            weight_t* neighbors_data = new weight_t[graph.edge_count * 2 * 2]; // Allocate space for both indices, weights and from
+            weight_t* neighbors_data = new weight_t[graph->edge_count * 2 * 2]; // Allocate space for both indices, weights and from
             size_t offset = 0;
-            for (size_t i = 0; i < graph.vert_count; i++) {
+            for (size_t i = 0; i < graph->vert_count; i++) {
                 // Set the pointer to the beginning of the adjacency list for the vertex
                 beg_ptr[i] = neighbors_data + offset;
                 // Copy the adjacency list for the vertex
-                index_t degree = graph.degree[i];
-                for (size_t j = graph.begin[i]; j < graph.begin[i + 1]; j++) {
-                    neighbors_data[offset] = static_cast<weight_t>(graph.adj[j]);
-                    neighbors_data[offset + degree] = graph.weight[j];
+                index_t degree = graph->degree[i];
+                for (size_t j = graph->begin[i]; j < graph->begin[i + 1]; j++) {
+                    neighbors_data[offset] = static_cast<weight_t>(graph->adj[j]);
+                    neighbors_data[offset + degree] = graph->weight[j];
                     offset++;
                 }
                 offset += degree;
@@ -266,326 +280,224 @@ class GPU_Dual_Graph{
         }
 
 
+        void preprocessStreamEdges(EdgeStream & stream_edges){
 
-        bool edge_exists(vertex_t u, vertex_t v, bool check_sparsifier){
-            if (u > v) swap(u, v);
-            long key = u * this->multiplier + v;;
+            OperationType op = stream_edges.current_op;
 
-            if (check_sparsifier) {
-                // Check in the sparsifier
-                return this->sparse_map->count(key) > 0;
-            }
-            // Check in the original graph
-            return this->dense_map->count(key) > 0;
-        }
+            auto it = stream_edges.batch_edges.begin();
+            while(it != stream_edges.batch_edges.end()){
 
-        
-        void edgeDeletion(GPU_Stream_Edges & stream_edges){
-            if (stream_edges.current_op != DECREMENTAL) {
-                cout << "Error: edgeDeletion called with non-decremental operation." << endl;
-                return;
-            }
+                auto [u, v, w] = *it;
+                if (u > v) swap(u, v);
+                long key = u * this->multiplier + v;
 
+                if (op == INCREMENTAL) {
 
+                   if (this->graph_map[DENSE]->count(key) > 0) {
+                        // edge already exist so add weights to exist edges
+                        cout << "Warning: Incremental Edge already exists in original graph, skip: " << u << " " << v << endl;
+                        it = stream_edges.batch_edges.erase(it);
 
+                        // do edge weights update here, in the function automatically check sparsifier  has this edge or not
+                        this->dualGraphEdgeweightsUpdate(u, v, w);
 
-        }
-        void edgeInsertion(
-            int* path_selected_flag, 
-            float* final_conductance,
-            int edge
-        ){
-            // Process results for current batch of samples
-            for (int i = 0; i < sample_count; i++){
-                int find_at = path_selected_flag[i]; // -1 if no path found
-                weight_t weight = sample_weights[sample_ptr/2 + i];
-                
-                // === Path Found: Edge is Successfully Sparsified ===
-                if(find_at != -1){ 
-                    // Do nothing - the sample edge is represented by the found path
-                    // This is the core sparsification: avoid adding redundant edges
-                }
-                // === No Path Found: Must Add Edge to Maintain Connectivity ===
-                else{ 
-                    no_path_count += 1;
+                    } else {
+                        // edge not exist in original graph as expected
 
-                    // Get source and destination from sample array layout
-                    int source = sample_nodes_all[sample_ptr + i];
-                    int target = sample_nodes_all[sample_ptr + sample_count + i];
-                    
-                    // Add edge to extension array in triplet format
-                    ext[ext_size*3] = source;
-                    ext[ext_size*3 + 1] = target;
-                    ext[ext_size*3 + 2] = weight;
-
-                    // Update vertex degrees (increment before use)
-                    int degree_source = ++degree_list[source];
-                    int degree_target = ++degree_list[target];
-
-                    // Add bidirectional edges to neighbor arrays
-                    manageExtraNeighborsData(source, target, weight, degree_source, degree_target);
-                    manageExtraNeighborsData(target, source, weight, degree_target, degree_source);
-
-                    ext_size += 1;
-                }
-            }
-            cout << "no path count: " << no_path_count << endl;
-
-            // === Sync Updated Graph Back to GPU ===
-            HRR(cudaMemcpy(neighbors_data_device, neighbors_data, sizeof(weight_t)*edge_count*4 * 2, cudaMemcpyHostToDevice));
-            HRR(cudaMemcpy(beg_ptr_device, beg_ptr_device_content, sizeof(weight_t*)*vert_count, cudaMemcpyHostToDevice));
-            HRR(cudaMemcpy(degree_list_device, degree_list, sizeof(vertex_t)*vert_count, cudaMemcpyHostToDevice));
-        }
-
-        bool removeAndUpdateDelEdges(){
-
-            int count = 0;
-            long key, a, b;
-
-            // adjust sample_num for the last batch
-            if (this->decremental_sample_ptr + 2 * this->decremental_sample_num >= this->decremental_edge_num * 2){
-                this->decremental_sample_num = this->decremental_edge_num - this->decremental_sample_ptr / 2;
-            }
-           
-            for(int i = 0; i < this->decremental_sample_num; i++){
-
-                a = decremental_edges[decremental_sample_ptr + i];
-                b = decremental_edges[decremental_sample_ptr + decremental_sample_num + i];
-                if(a > b) swap(a, b);
-                key = a * this->multiplier + b;
-
-                if(this->dense_map->count(key) ==0){
-                    cout << "dense_map not found: a: " << a << " b: " << b << " key: " << key << endl;
-                }
-                if(this->dense_map->count(key) > 0){ 
-                    // if this edge is in the dense graph, remove it from dense
-
-                    pair<vertex_t,vertex_t> value = this->dense_map->at(key);
-                    index_t index_b_a = value.first; // b at a
-                    index_t index_a_b = value.second; // a at b
-
-                    dense_map->erase(key);
-                    // dense graph: 
-                    // beg_ptr don't need to be updated, because the degree shrunk
-                    // degree_list need to be updated
-                    int degree_a = this->dense_degree_list[a] -= 1;
-                    int degree_b = this->dense_degree_list[b] -= 1;
-                    // neighbors_data need to be updated. //col, weight, from, reverse
-                    assert(degree_a != 0);
-                    assert(degree_b != 0);
-                    int interval_a = this->dense_degree_original[a];
-                    int interval_b = this->dense_degree_original[b];
-
-                    // if it's last edge in the vertex, don't need to update the neighbors_data
-                    if(degree_a != index_b_a){
-                        // else put the deleted edge to the last position, ignore it by --degree
-                        vertex_t a_last = this->dense_beg_ptr[a][degree_a];
-                        this->dense_beg_ptr[a][index_b_a] = a_last; // col
-                        this->dense_beg_ptr[a][index_b_a + interval_a] = this->dense_beg_ptr[a][degree_a + interval_a]; // weight
-
-
-                        if(a<a_last){
-                            long key_last = a * this->multiplier + a_last;
-                            this->dense_map->at(key_last).first = index_b_a;
-                        }
-                        else{
-                            long key_last = a_last * this->multiplier + a;
-                            this->dense_map->at(key_last).second = index_b_a;
+                        if (this->graph_map[SPARSE]->count(key) > 0) {
+                            // illegal state
+                            cerr << "Error: Edge not exists in original graph, but in sparsifier: " << u << " " << v << endl;
+                            exit(EXIT_FAILURE);
                         }
 
+                        this->edgeInsertion(u, v, w, DENSE);
+
+                        ++it; // keep it for NBRW
                     }
 
-                    if(degree_b != index_a_b){
-                        vertex_t b_last = this->dense_beg_ptr[b][degree_b];
-                        this->dense_beg_ptr[b][index_a_b] = b_last; // col
-                        this->dense_beg_ptr[b][index_a_b + interval_b] = this->dense_beg_ptr[b][degree_b + interval_b]; // weight
+                } else if (op == DECREMENTAL) {
 
-                        if(b < b_last){
-                            long key_last = b * this->multiplier + b_last;
-                            this->dense_map->at(key_last).first = index_a_b;
+                    if (this->graph_map[DENSE]->count(key) == 0) {
+
+                        // edge not exist in original graph, just skip it
+                        cout << "Warning: Decremental Edge not exist in original graph, skip: " << u << " " << v << endl;
+                        it = stream_edges.batch_edges.erase(it);
+
+                        if (this->graph_map[SPARSE]->count(key) > 0) {
+                            // illegal state
+                            cerr << "Error: Edge not exists in original graph, but exists in sparsifier: " << u << " " << v << endl;
+                            exit(EXIT_FAILURE);
                         }
-                        else{
-                            long key_last = b_last * this->multiplier + b;
-                            this->dense_map->at(key_last).second = index_a_b;
+
+                    } else {
+                        // edge exists in original graph, as expected
+                        // do edge deletion for dense graph here
+                        this->edgeDeletion(u, v, DENSE);
+                        if (this->graph_map[SPARSE]->count(key) > 0) {
+                            // edge also exists in sparsifier
+                            // do edge deletion for sparse graphs here
+                            this->edgeDeletion(u, v, SPARSE);
+                            ++it; // keep it for NBRW
+                            
+                        } else {
+                            // edge not exist in sparsifer, just remove it from dense, not need NBRW
+                            it = stream_edges.batch_edges.erase(it);
                         }
-                    }
-
-                   
-
-                    if(this->sparse_map->count(key) ==0){
-                     cout << "sparse_map not found: a: " << a << " b: " << b << " key: " << key << endl;
-                    }
-                    // sparse graph: mtx_sparse
-                    // if this edge is in the sparse graph, remove it from sparse (not necessarily in the sparse graph)
-                    if (this->sparse_map->count(key) > 0){
                         
-                        // pair<vertex_t,vertex_t> value = this->sparse_map->at(key);
-                        // index_t index_b_a = value.first; // b at a
-                        // index_t index_a_b = value.second; // a at b
-                        this->sparse_map->erase(key);
+                    }
 
-                        // degree_a = this->sparse_degree_list[a] -= 1;
-                        // degree_b = this->sparse_degree_list[b] -= 1;
-                        // assert(degree_a != 0);
-                        // assert(degree_b != 0);
-                        // interval_a = this->sparse_degree_original[a];
-                        // interval_b = this->sparse_degree_original[b];
-
-                        // if(degree_a != index_b_a){
-                        //     vertex_t a_last = this->sparse_beg_ptr[a][degree_a];
-                        //     this->sparse_beg_ptr[a][index_b_a] = a_last; // col
-                        //     this->sparse_beg_ptr[a][index_b_a + interval_a] = this->sparse_beg_ptr[a][degree_a + interval_a]; // weight
-
-                        //     if(a < a_last){
-                        //         long key_last = a * this->multiplier + a_last;
-                        //         this->sparse_map->at(key_last).first = index_b_a;
-                        //     }
-                        //     else{
-                        //         long key_last = a_last * this->multiplier + a;
-                        //         this->sparse_map->at(key_last).second = index_b_a;
-                        //     }
-                        // }
-
-                        // if(degree_b != index_a_b){
-                        //     vertex_t b_last = this->sparse_beg_ptr[b][degree_b];
-                        //     this->sparse_beg_ptr[b][index_a_b] = b_last; // col
-                        //     this->sparse_beg_ptr[b][index_a_b + interval_b] = this->sparse_beg_ptr[b][degree_b + interval_b]; // weight
-
-                        //     if(b < b_last){
-                        //         long key_last = b * this->multiplier + b_last;
-                        //         this->sparse_map->at(key_last).first = index_a_b;
-                        //     }
-                        //     else{
-                        //         long key_last = b_last * this->multiplier + b;
-                        //         this->sparse_map->at(key_last).second = index_a_b;
-                        //     }
-                        // }
-
-                        // only add the edge to filted_sample_nodes if it was in the sparse graph, then it will be used for random walk
-                        filted_del_sample_edges[count] = a;
-                        filted_del_sample_edges[count + decremental_sample_num ] = b;
-                        count += 1;
-                    } // if exist in sparse graph end
-                } // if exist in dense graph end
-            } // for loop end
-
-            this->filtered_del_sample_count = count; // read from outside to determine the block num
-            // update the sample_ptr, copy the filted_del_sample_edges to device
-            if (this->decremental_sample_ptr != 0){ // first time, copy graph handle by other function
-                    HRR(cudaMemcpy(dense_degree_list_device, dense_degree_list, sizeof(vertex_t)*vertex_num, cudaMemcpyHostToDevice));
-                    HRR(cudaMemcpy(dense_neighbors_data_device, dense_neighbors_data, sizeof(weight_t)*dense_edge_num*4 * 2, cudaMemcpyHostToDevice));
+                }
             }
-            HRR(cudaMemcpy(decremental_sample_nodes_device, filted_del_sample_edges, sizeof(vertex_t)*decremental_sample_num*2, cudaMemcpyHostToDevice));
-            
-            this->decremental_sample_ptr += this->decremental_sample_num * 2;
-
-            if (this->decremental_sample_ptr < this->decremental_edge_num * 2){ 
-                return false;
-            }
-            else{
-                return true;
-            }
-            
-        } 
-        
-        void copyDualGraphToDevice(){
-            HRR(cudaMemcpy(sparse_degree_list_device, sparse_degree_list, sizeof(vertex_t)*vertex_num, cudaMemcpyHostToDevice));
-            HRR(cudaMemcpy(sparse_degree_original_device, sparse_degree_original, sizeof(vertex_t)*vertex_num, cudaMemcpyHostToDevice));
-            HRR(cudaMemcpy(sparse_beg_ptr_device, sparse_beg_ptr_device_content, sizeof(weight_t*)*vertex_num, cudaMemcpyHostToDevice));
-            HRR(cudaMemcpy(sparse_neighbors_data_device, sparse_neighbors_data, sizeof(weight_t)*sparse_edge_num*2 * 2, cudaMemcpyHostToDevice));
-
-            HRR(cudaMemcpy(dense_degree_list_device, dense_degree_list, sizeof(vertex_t)*vertex_num, cudaMemcpyHostToDevice));
-            HRR(cudaMemcpy(dense_degree_original_device, dense_degree_original, sizeof(vertex_t)*vertex_num, cudaMemcpyHostToDevice));
-            HRR(cudaMemcpy(dense_beg_ptr_device, dense_beg_ptr_device_content, sizeof(weight_t*)*vertex_num, cudaMemcpyHostToDevice));
-            HRR(cudaMemcpy(dense_neighbors_data_device, dense_neighbors_data, sizeof(weight_t)*dense_edge_num*2 * 2, cudaMemcpyHostToDevice));
+            // update to GPU
+            this->updateDeviceDualGraph();
         }
 
-        /**
-         * Process random walk results and update sparse graph incrementally
-         * 
-         * After random walks complete, this method processes the results:
-         * 
-         * 1. **Path Found**: Reconstruct and add alternative path edges to sparse graph
-         * 2. **No Path**: Mark edge for heuristic recovery (essential for connectivity)
-         * 3. **Edge Recovery**: Add intermediate path edges to maintain connectivity
-         * 4. **Tracking**: Record all added edges for analysis and output
-         * 
-         * Key Logic: If random walk finds alternative path, the removed edge can be
-         * safely omitted from sparse graph since connectivity is preserved via the path.
-         * 
-         * @param path_selected Array of path vertices for each successful walk  
-         * @param path_selected_flag Array indicating if path was found (-1 if not)
-         * @param final_conductance Array of path conductance values
-         * @param n_steps Maximum steps per path
-         */
-        void incrementalUpdateSparse(int* path_selected, int* path_selected_flag, float* final_conductance, int n_steps){
-            int interval = n_steps;
-            int count = 0;
-            long a, b, key;
-            int add_count = 0;
-            for (int i = 0; i < this->filtered_del_sample_count; i++){
+        void updateDeviceDualGraph(){
+            for (int graph_type = 0; graph_type < 2; graph_type++){
+                HRR(cudaMemcpy(degree_list_device[graph_type], degree_list[graph_type], sizeof(vertex_t)*vertex_num, cudaMemcpyHostToDevice));
+                HRR(cudaMemcpy(bin_size_device[graph_type], bin_size[graph_type], sizeof(vertex_t)*vertex_num, cudaMemcpyHostToDevice));
+                HRR(cudaMemcpy(beg_ptr_device[graph_type], beg_ptr_device_content[graph_type], sizeof(weight_t*)*vertex_num, cudaMemcpyHostToDevice));
+                HRR(cudaMemcpy(concatenated_neighbors_data_device[graph_type], concatenated_neighbors_data[graph_type], sizeof(weight_t)*edge_num[graph_type]*2 * 2, cudaMemcpyHostToDevice));
+            }
+        }
 
-                int find_at = path_selected_flag[i]; // include source and target
 
-                int source = this->filted_del_sample_edges[i];
-                int target = this->filted_del_sample_edges[i + decremental_sample_num];
-                int from = path_selected[interval*i];
-                
-                if (find_at != -1){
-                    // recover these edges to sparse_map
-                    assert(from == source);
-                    assert(path_selected[interval*i + find_at] == target);
-                    for (int j = 0; j < find_at; j++){
+        void dualGraphEdgeweightsUpdate(vertex_t a, vertex_t b, weight_t added_weight){
+            long key = a * this->multiplier + b;
+            index_t b_index_in_a, a_index_in_b;
 
-                        int to = path_selected[interval*i + j + 1];
-                        
-                        a = from;
-                        b = to;
-                        if(a > b) swap(a, b);
-                        key = a * this->multiplier + b;
-                        if (sparse_map->count(key) == 0){
-                            add_count += 1;
-                            sparse_map->insert({key, {0,0}});
-                            added_edges->insert(key);
-                        }
+            for (int graph_type = 0; graph_type < 2; graph_type++) {
+                if (this->graph_map[graph_type]->count(key) > 0) {
+                    b_index_in_a = this->graph_map[graph_type]->at(key).first;
+                    a_index_in_b = this->graph_map[graph_type]->at(key).second;
 
-                        from = to;
-                    }
-                    
+                    this->beg_ptr[graph_type][a][b_index_in_a] += added_weight;
+                    this->beg_ptr[graph_type][b][a_index_in_b] += added_weight;
+                }
+            }
+        }
+
+        void edgeInsertion(vertex_t a, vertex_t b, weight_t weight, int graph_type){
+
+            if (a > b) swap(a, b);
+            long key = a * this->multiplier + b;
+            int degree_a, degree_b;
+
+            if (this->graph_map[graph_type]->count(key) == 0){
+
+                degree_a = ++this->degree_list[graph_type][a];
+                degree_b = ++this->degree_list[graph_type][b];
+
+
+                this->graph_map[graph_type]->emplace(key, make_pair(degree_a -1, degree_b -1));
+
+                edgeInsertionForNeighborData(a, b, degree_a, weight, graph_type);
+                edgeInsertionForNeighborData(b, a, degree_b, weight, graph_type);
+
+            }else{
+                //error
+                cerr << "Error: Edge already exists in graph map: " << a << " " << b << endl;
+                exit(EXIT_FAILURE);
+            }
+
+        }
+
+
+        void edgeInsertionForNeighborData(vertex_t a, vertex_t b, int degree_a, weight_t weight, int graph_type){
+
+            int bin_a = this->bin_size[graph_type][a];
+    
+            if (degree_a <= bin_a) {
+                this->beg_ptr[graph_type][a][degree_a - 1] = b;
+                this->beg_ptr[graph_type][a][degree_a - 1 + bin_a] = weight;
+            } else {
+                assert(degree_a == bin_a + 1);
+                this->bin_size[graph_type][a] += 1; // expand bin size
+
+                weight_t *ptr_old = this->beg_ptr[graph_type][a];
+                weight_t *ptr_new = this->extra_neighbor_data[graph_type] + this->extra_neighbor_offset[graph_type];
+
+                // Copy existing neighbor data to new location with expanded layout
+                for (int i = 0, j = 0; i < degree_a - 1; i++, j++) {
+                    if (j % degree_a == degree_a - 1) { j++; }
+                    ptr_new[j] = ptr_old[i];
+                }
+                ptr_new[degree_a - 1] = static_cast<weight_t>(b);
+                ptr_new[2 * degree_a - 1] = weight;
+
+                this->beg_ptr[graph_type][a] = ptr_new;
+
+                weight_t *ptr_new_device = reinterpret_cast<weight_t *>(extra_neighbor_data_device[graph_type]) + extra_neighbor_offset[graph_type];
+                this->beg_ptr_device_content[graph_type][a] = ptr_new_device;
+
+                this->extra_neighbor_offset[graph_type] += degree_a * 2;
+            }
+
+        }
+
+
+
+
+        void edgeDeletion(vertex_t a, vertex_t b, int graph_type){
+
+            if (a > b) swap(a, b);
+            long key = a * this->multiplier + b;
+
+            if (this->graph_map[graph_type]->count(key) > 0) {
+
+                index_t b_index_in_a = this->graph_map[graph_type]->at(key).first;
+                index_t a_index_in_b = this->graph_map[graph_type]->at(key).second;
+
+
+                this->graph_map[graph_type]->erase(key);
+
+                int degree_a = --this->degree_list[graph_type][a];
+                int degree_b = --this->degree_list[graph_type][b];
+
+                assert(degree_a != 0);
+                assert(degree_b != 0);
+                this->edgeDeletionForNeighborData(a, b, degree_a, b_index_in_a, graph_type);
+                this->edgeDeletionForNeighborData(b, a, degree_b, a_index_in_b, graph_type);
+
+            } else {
+                cerr << "Error: Edge does not exist in graph map: " << a << " " << b << endl;
+                exit(EXIT_FAILURE);
+            }
+
+        }
+
+        void edgeDeletionForNeighborData(vertex_t a, vertex_t b, int degree_a, index_t b_index_in_a, int graph_type){
+
+            int bin_a = this->bin_size[graph_type][a]; // no need change bin size
+
+            // if it's last edge in the vertex, don't need to update the neighbors_data
+            if(degree_a != b_index_in_a){
+                // else put the deleted edge to the last position, ignore it by --degree
+                vertex_t a_last = this->beg_ptr[graph_type][a][degree_a];
+                this->beg_ptr[graph_type][a][b_index_in_a] = a_last; // col
+                this->beg_ptr[graph_type][a][b_index_in_a + bin_a] = this->beg_ptr[graph_type][a][degree_a + bin_a]; // weight
+
+                if (a < a_last){
+                    long key = a * this->multiplier + a_last;
+                    this->graph_map[graph_type]->at(key).first = b_index_in_a;
                 }
                 else{
-                    // mark these edges for heuristic recovery
-                    // cout << "No path for edge: " << source << " " << target << endl;
-                    this->decremental_no_path_count += 1;
-                    heuristic_sample_nodes[count] = source;
-                    heuristic_sample_nodes[count + 1] = target;
-                    count += 2;
+                    long key = a_last * this->multiplier + a;
+                    this->graph_map[graph_type]->at(key).second = b_index_in_a;
                 }
-            }
-            cout << "No path count: " << count/2 << endl;
-            cout << "Added edges: " << add_count << endl;
-            this->heuristic_sample_num = count;
-            if(count > 0){
-                HRR(cudaMemcpy(heuristic_sample_nodes_device, heuristic_sample_nodes, sizeof(vertex_t)*heuristic_sample_num, cudaMemcpyHostToDevice));
+
             }
         }
 
-        /**
-         * Heuristic Recovery: Add essential edges using short random walks
-         * 
-         * For edges where no alternative paths were found during main processing,
-         * this method performs short random walks to find minimal connectivity paths:
-         * 
-         * 1. **Short Walks**: Perform multiple short (3-step) walks from each endpoint
-         * 2. **Path Addition**: Add all intermediate edges from successful walks
-         * 3. **Connectivity Insurance**: Ensures graph remains connected despite aggressive removal
-         * 
-         * This is a fallback mechanism to preserve essential connectivity when
-         * the main decremental algorithm cannot find alternative paths.
-         * 
-         * @param path_selected Array containing short walk paths
-         * @param n_walker Number of parallel walkers per endpoint
-         */
+
+        void updateSparsiferFromResult(GPU_Stream_Edges & g_stream_edges){
+
+            for (){
+                
+            }
+        }
+
+ 
         void heuristicRecovery(int * path_selected, int n_walker){
             int steps = 3;
             int num = this->heuristic_sample_num;
@@ -641,21 +553,6 @@ class GPU_Dual_Graph{
                 
         }
 
-        // saved edges are 1-based
-        void save_added_edges(string file_name){
-            cout << "Size of added edges: " << added_edges->size() << endl;
-            std::ofstream txt_file(file_name, std::ios::out);
-            if(txt_file.is_open()){
-                for(auto it = added_edges->begin(); it != added_edges->end(); ++it){
-
-                    long key = *it;
-                    long a = key / this->multiplier;
-                    long b = key % this->multiplier;
-                    txt_file << a + 1 << " " << b + 1 << std::endl;
-                }
-            }
-            cout<< "Added edges saved to: " << file_name << endl; 
-        }
 
         ~GPU_Dual_Graph(){ 
             // shared properties
