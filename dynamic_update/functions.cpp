@@ -402,7 +402,7 @@ CSRGraph::CSRGraph(const char* filename) {
     this->weight.resize(this->edge_count);        // Edge weights corresponding to adj entries
     this->degree.resize(this->vert_count, 0);     // Vertex degrees (will be recalculated)
     this->from.resize(this->edge_count);          // Original edge index mapping
-    this->mtx.resize(line_count);                 // Original edge tuples (src, dest, weight)
+    // this->mtx.resize(line_count);                 // Original edge tuples (src, dest, weight)
     this->reverse.resize(this->edge_count);       // Reverse edge mapping
     
     // === Key Enhancement: Edge Mapping for O(1) Deletion ===
@@ -521,12 +521,12 @@ CSRGraph::CSRGraph(const char* filename) {
         if (is_reverse) this->weight[this->begin[dest] + this->degree[dest]] = wtvalue;
 
         // Store original edge tuple for reference
-        this->mtx[offset] = make_tuple(src, dest, wtvalue);
+        // this->mtx[offset] = make_tuple(src, dest, wtvalue);
 
         // === BUILD EDGE MAPPING FOR O(1) DELETION ===
         // Create unique hash key for undirected edge pair
         long a = src, b = dest;
-        int degree_a = this->degree[a], degree_b = this->degree[b];
+        index_t degree_a = this->degree[a], degree_b = this->degree[b];
         if (a > b) {
             swap(a, b);           // Ensure consistent ordering (smaller vertex first)
             swap(degree_a, degree_b);   
@@ -537,11 +537,10 @@ CSRGraph::CSRGraph(const char* filename) {
         
         // Map to current positions in adjacency arrays
         // This enables O(1) lookup for edge deletion: given (src,dest), find positions immediately
-        pair<index_t,index_t> value = {degree_a, degree_b};
-        this->edge_map.insert({key, value});
 
-        
-        
+
+        this->edge_map.emplace(key, EdgeInfo{degree_a, degree_b, wtvalue});
+
         // Update degree counters (used as insertion positions)
         this->degree[src]++;
         if (is_reverse) this->degree[dest]++;

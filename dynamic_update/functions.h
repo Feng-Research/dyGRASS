@@ -62,6 +62,13 @@ struct GraphInfo {
       vertex_t v_max, v_min;
   };
 
+struct EdgeInfo {
+      index_t index_a;  // Index of b in a's neighbor list
+      index_t index_b;  // Index of a in b's neighbor list  
+      weight_t weight;  // Edge weight
+  };
+
+
 class CSRGraph {
     public:
     // === Core CSR representation ===
@@ -73,10 +80,10 @@ class CSRGraph {
     // === Additional metadata for sparsification ===
     vector<vertex_t> from;       // Original edge index from MTX file
     vector<vertex_t> reverse;    // Reverse edge lookup for undirected graphs
-    vector<tuple<vertex_t, vertex_t, weight_t>> mtx; // Original edge list format
+    // vector<tuple<vertex_t, vertex_t, weight_t>> mtx; // Original edge list format
     
     // === Edge mapping for efficient operations ===
-    unordered_map<long, pair<index_t,index_t>> edge_map; // (src,dest) -> (pos1,pos2) for O(1) deletion
+    unordered_map<long, EdgeInfo> edge_map; // (src,dest) -> (pos1,pos2) for O(1) deletion
     
     // === Graph statistics ===
     size_t line_count;           // Number of original edges (undirected pairs)

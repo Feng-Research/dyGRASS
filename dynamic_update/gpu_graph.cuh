@@ -40,13 +40,13 @@ static void HandleError( cudaError_t err,
 # define SPARSE 1
 
 class GPU_Stream_Edges{
-    private:
+
+    public:
+
         size_t max_capacity;
         bool overflow_flag;
         size_t  next_run_index;
-       
 
-    public:
         int n_steps;
         size_t batch_size;
         size_t load_size;
@@ -89,11 +89,16 @@ class GPU_Stream_Edges{
             this->path_selected = new int[max_capacity * n_steps];
             this->path_selected_flag = new int[max_capacity];
 
+            this->heuristic_sample_nodes = new vertex_t[max_capacity * 2];
+        
+
             HRR(cudaMalloc((void **)&edges_device, sizeof(vertex_t)*max_capacity * 2));
             HRR(cudaMalloc((void **)&weights_device, sizeof(weight_t)*max_capacity));
 
             HRR(cudaMalloc((void **)&path_selected_device, sizeof(int)*max_capacity * n_steps));
             HRR(cudaMalloc((void **)&path_selected_flag_device, sizeof(int)*max_capacity));
+
+            HRR(cudaMalloc((void **)&heuristic_sample_nodes_device, sizeof(vertex_t)*max_capacity * 2));
 
         }
 
@@ -102,6 +107,7 @@ class GPU_Stream_Edges{
             this->batch_size = edge_stream.batch_size;
             assert(batch_size == edge_stream.batch_edges.size());
             this->current_op = edge_stream.current_op;
+            this->next_run_index = 0;
 
             if (this->edges != nullptr && this->weights != nullptr){
                 delete[] this->edges;
@@ -122,7 +128,13 @@ class GPU_Stream_Edges{
 
         }
 
+        bool next_run_exist(){
+            return this->next_run_index < this->batch_size;
+        }
+        
         void loadEdgesToDevice(){
+            this->heuristic_sample_num = 0;
+
             if (this->edges == nullptr || this->weights == nullptr){
                 cout << "Error: edges or weights not loaded." << endl;
                 std::cerr << "Edges not loaded to GPU stream." << std::endl;
@@ -134,15 +146,16 @@ class GPU_Stream_Edges{
 
                 this->overflow_flag = true;
                 this->load_size = this->max_capacity;
-                this->next_run_index += this->max_capacity;
+                
                 
             }
             else{
 
                 this->overflow_flag = false;
                 this->load_size = this->batch_size - this->next_run_index;  
-                this->next_run_index = 0; // reset for next batch
             }
+
+            this->next_run_index += this->load_size;
 
             HRR(cudaMemcpy(edges_device, edges + (next_run_index * 2), sizeof(vertex_t) * load_size * 2, cudaMemcpyHostToDevice));
             if (this->current_op == INCREMENTAL){
@@ -158,17 +171,34 @@ class GPU_Stream_Edges{
             HRR(cudaMemcpy(path_selected_flag, path_selected_flag_device, sizeof(int) * load_size, cudaMemcpyDeviceToHost));
         }
 
+        void heuristicRecovery(){
+            if (this->heuristic_sample_num == 0) {
+                cout << "Wrong call to heuristicRecovery()" << endl;
+                return;
+            } else {
+                HRR(cudaMemcpy(heuristic_sample_nodes_device, heuristic_sample_nodes, sizeof(vertex_t) * heuristic_sample_num * 2, cudaMemcpyHostToDevice));
+                // Launch heuristic recovery kernel here
+                //TODO: launch heuristicRecoveryKernel<<<grid, block>>>(...);
+                int size =  heuristic_sample_num * 3 * 16;
+                assert(size  < load_size * n_steps);
+                HRR(cudaMemcpy(path_selected_device, path_selected, sizeof(vertex_t) * size , cudaMemcpyHostToDevice));
+            }
+        }
+
 
         ~GPU_Stream_Edges(){
             delete[] edges;
             delete[] weights;
             delete[] path_selected;
             delete[] path_selected_flag;
+            delete[] heuristic_sample_nodes;
+            
 
             cudaFree(edges_device);
             cudaFree(weights_device);
             cudaFree(path_selected_device);
             cudaFree(path_selected_flag_device);
+            cudaFree(heuristic_sample_nodes_device);
             cout << "GPU_Stream_Edges deallocated" << endl;
         }
 
@@ -188,7 +218,7 @@ class GPU_Dual_Graph{
 
         // try new thing
         index_t edge_num[2];
-        unordered_map<long, pair<index_t,index_t>> * graph_map[2]; // Edge mapping for O(1) operations
+        unordered_map<long, EdgeInfo>  * graph_map[2]; // Edge mapping for O(1) operations
         vertex_t * degree_list[2];          // Current degrees (updated during edge removal)
         vertex_t * bin_size[2];              // Original degrees (for memory layout)
         weight_t ** beg_ptr[2];             // Pointers to neighbor data blocks
@@ -368,9 +398,10 @@ class GPU_Dual_Graph{
 
             for (int graph_type = 0; graph_type < 2; graph_type++) {
                 if (this->graph_map[graph_type]->count(key) > 0) {
-                    b_index_in_a = this->graph_map[graph_type]->at(key).first;
-                    a_index_in_b = this->graph_map[graph_type]->at(key).second;
+                    b_index_in_a = this->graph_map[graph_type]->at(key).index_a;
+                    a_index_in_b = this->graph_map[graph_type]->at(key).index_b;
 
+                    this->graph_map[graph_type]->at(key).weight += added_weight;
                     this->beg_ptr[graph_type][a][b_index_in_a] += added_weight;
                     this->beg_ptr[graph_type][b][a_index_in_b] += added_weight;
                 }
@@ -381,7 +412,7 @@ class GPU_Dual_Graph{
 
             if (a > b) swap(a, b);
             long key = a * this->multiplier + b;
-            int degree_a, degree_b;
+            index_t degree_a, degree_b;
 
             if (this->graph_map[graph_type]->count(key) == 0){
 
@@ -389,7 +420,7 @@ class GPU_Dual_Graph{
                 degree_b = ++this->degree_list[graph_type][b];
 
 
-                this->graph_map[graph_type]->emplace(key, make_pair(degree_a -1, degree_b -1));
+                this->graph_map[graph_type]->emplace(key, EdgeInfo{degree_a - 1, degree_b - 1, weight});
 
                 edgeInsertionForNeighborData(a, b, degree_a, weight, graph_type);
                 edgeInsertionForNeighborData(b, a, degree_b, weight, graph_type);
@@ -416,6 +447,11 @@ class GPU_Dual_Graph{
 
                 weight_t *ptr_old = this->beg_ptr[graph_type][a];
                 weight_t *ptr_new = this->extra_neighbor_data[graph_type] + this->extra_neighbor_offset[graph_type];
+                //check if extra memory is exhausted
+                if (ptr_new + degree_a * 2 > this->extra_neighbor_data[graph_type] + this->edge_num[graph_type]*2){
+                    cerr << "Error: Extra memory exhausted" << endl;
+                    exit(EXIT_FAILURE);
+                }
 
                 // Copy existing neighbor data to new location with expanded layout
                 for (int i = 0, j = 0; i < degree_a - 1; i++, j++) {
@@ -445,8 +481,8 @@ class GPU_Dual_Graph{
 
             if (this->graph_map[graph_type]->count(key) > 0) {
 
-                index_t b_index_in_a = this->graph_map[graph_type]->at(key).first;
-                index_t a_index_in_b = this->graph_map[graph_type]->at(key).second;
+                index_t b_index_in_a = this->graph_map[graph_type]->at(key).index_a;
+                index_t a_index_in_b = this->graph_map[graph_type]->at(key).index_b;
 
 
                 this->graph_map[graph_type]->erase(key);
@@ -479,11 +515,11 @@ class GPU_Dual_Graph{
 
                 if (a < a_last){
                     long key = a * this->multiplier + a_last;
-                    this->graph_map[graph_type]->at(key).first = b_index_in_a;
+                    this->graph_map[graph_type]->at(key).index_a = b_index_in_a;
                 }
                 else{
                     long key = a_last * this->multiplier + a;
-                    this->graph_map[graph_type]->at(key).second = b_index_in_a;
+                    this->graph_map[graph_type]->at(key).index_b = b_index_in_a;
                 }
 
             }
@@ -492,99 +528,113 @@ class GPU_Dual_Graph{
 
         void updateSparsiferFromResult(GPU_Stream_Edges & g_stream_edges){
 
-            for (){
-                
-            }
-        }
+            int count = 0;
+            int incremental_no_found_count = 0;
+            int decremental_no_found_count = 0;
 
- 
-        void heuristicRecovery(int * path_selected, int n_walker){
-            int steps = 3;
-            int num = this->heuristic_sample_num;
-            // for each edge in the filted_sample_nodes, if it is not in the sparse_map, add it to the sparse_map
-
-            for (int i = 0; i < num; i ++){
-                int source = heuristic_sample_nodes[i];
-                int start_at = i * steps * n_walker;
-                // int from = path_selected[start_at];
-                // assert(from == source);
-                for (int j = 0; j < n_walker; j++){
-
-                    int from = path_selected[start_at + j * steps];
-                    assert(from == source);
-
-                    for (int k = 1; k < steps; k++){
-
-                        int to = path_selected[start_at + j * steps + k];
-                        int a = from;
-                        int b = to;
-                        if(a > b) swap(a, b);
-                        long key = a * this->multiplier + b;
-                        if (sparse_map->count(key) == 0){
-                            sparse_map->insert({key, {0,0}});
-                        }
-                        from = to;
+            g_stream_edges.downloadResult();
+            int batch_size = g_stream_edges.load_size;
+            int start_index = g_stream_edges.next_run_index - batch_size;
+            if (g_stream_edges.current_op == INCREMENTAL){
+                // for incremental, just add all found edges to sparse graph
+                for (int i = 0; i < batch_size; i++){
+                    if (g_stream_edges.path_selected_flag[i] == 1){
+                        vertex_t a = g_stream_edges.edges[start_index + i * 2];
+                        vertex_t b = g_stream_edges.edges[start_index + i * 2 + 1];
+                        weight_t w = g_stream_edges.weights[start_index + i];
+                        this->edgeInsertion(a, b, w, SPARSE);
+                        count++;
+                    }else{
+                        incremental_no_found_count++;
                     }
                 }
+            } else if (g_stream_edges.current_op == DECREMENTAL){
+                // for decremental, check the path_selected_flag, if 1, add the path to sparse graph
+                for (int i = 0; i < batch_size; i++){
+                    
+                    vertex_t a = g_stream_edges.edges[start_index + i * 2];
+                    vertex_t b = g_stream_edges.edges[start_index + i * 2 + 1];
+                    int path_length = g_stream_edges.path_selected_flag[i];
+
+                    if (path_length != 0){
+                        
+                        int path_start = i * g_stream_edges.n_steps;
+                        vertex_t from = a;
+
+                        for (int j = 0; j < path_length; j++){
+
+                            vertex_t b = g_stream_edges.path_selected[path_start + j];
+                            if ( a > b) swap(a, b);
+                            long key = a * this->multiplier + b;
+
+                            if (this->graph_map[SPARSE]->count(key) == 0){
+                                count++;
+                                weight_t weight = this->graph_map[DENSE]->at(key).weight;
+                                this->edgeInsertion(a, b, weight, SPARSE);
+                            }
+                            
+                            a = b;
+
+                        }
+                        
+                    }else{
+
+                        // int current_index = 
+                        g_stream_edges.heuristic_sample_nodes[decremental_no_found_count * 2] = a;
+                        g_stream_edges.heuristic_sample_nodes[decremental_no_found_count * 2 + 1] = b;
+
+                        decremental_no_found_count++;
+
+                    }
+                }
+
             }
-            // for (int i = 0; i < this->filted_sample_count; i++){
-            //     int a = filted_sample_nodes[i];
-            //     int b = filted_sample_nodes[i + sample_count];
-            //     if(a > b) swap(a, b);
-            //     long key = a * this->multiplier + b;
-            //     if (sparse_map->count(key) == 0){
-            //         sparse_map->insert({key, 0});
+
+            g_stream_edges.heuristic_sample_num = decremental_no_found_count;
+            cout << "Sparsifier updated with " << count << " edges from stream." <<  endl;
+            if (count > 0){
+                updateDeviceDualGraph();
+            }
+
+            if(decremental_no_found_count > 0){
+                cout << "Not implemented yet" << endl;
+                cout << "Heuristic recovery needed for " << decremental_no_found_count << " edges." <<  endl;
+                g_stream_edges.heuristicRecovery();
+                
+                // for (int i = 0; i < decremental_no_found_count; i++){
+                    
+                //     vertex_t a = g_stream_edges.heuristic_sample_nodes[i * 2];
+                //     vertex_t b = g_stream_edges.heuristic_sample_nodes[i * 2 + 1];
+
+
+                //     int path_length = 3;
+                // }
+                    
+            }
+
+        }
+        
+
+ 
+       
+        void sparse_map_to_1_based_mtx(string file_name){
+            // std::ofstream txt_file(file_name, std::ios::out);
+            // if(txt_file.is_open()){
+            //     for(auto it = sparse_map->begin(); it != sparse_map->end(); ++it){
+
+            //         auto key = it->first;
+            //         long a = key / this->multiplier;
+            //         long b = key % this->multiplier;
+            //         txt_file << a + 1 << " " << b + 1 << " " << 1 << std::endl;
             //     }
             // }
-        }
-
-        void sparse_map_to_1_based_mtx(string file_name){
-            std::ofstream txt_file(file_name, std::ios::out);
-            if(txt_file.is_open()){
-                for(auto it = sparse_map->begin(); it != sparse_map->end(); ++it){
-
-                    auto key = it->first;
-                    long a = key / this->multiplier;
-                    long b = key % this->multiplier;
-                    txt_file << a + 1 << " " << b + 1 << " " << 1 << std::endl;
-                }
-            }
-            cout<< "Updated sparse mtx file saved to: " << file_name << endl; 
+            // cout<< "Updated sparse mtx file saved to: " << file_name << endl; 
                 
         }
 
 
         ~GPU_Dual_Graph(){ 
-            // shared properties
-            delete[] heuristic_sample_nodes;
-            cudaFree(heuristic_sample_nodes_device);
-            delete added_edges;
-
-            // del edge
-            delete[] filted_del_sample_edges;
-            cudaFree(decremental_sample_nodes_device);
-
-            // sparse graph
-            // delete[] sparse_array_mtx;
-            // delete[] sparse_array_ext;
-            // delete[] sparse_degree_original;
-            // delete[] sparse_beg_ptr;
-            // delete[] sparse_neighbors_data;
-            // delete[] sparse_beg_ptr_device_content;
-            // cudaFree(sparse_degree_list_device);
-            // cudaFree(sparse_degree_original_device);
-            // cudaFree(sparse_beg_ptr_device);
-            // cudaFree(sparse_neighbors_data_device);
-
-            // dense graph  
-            delete[] dense_degree_original;
-            delete[] dense_beg_ptr;
-            delete[] dense_neighbors_data;
-            delete[] dense_beg_ptr_device_content;
-            cudaFree(dense_degree_list_device);
-            cudaFree(dense_degree_original_device);
-            cudaFree(dense_beg_ptr_device);
-            cudaFree(dense_neighbors_data_device);
+            
         }
         
 };

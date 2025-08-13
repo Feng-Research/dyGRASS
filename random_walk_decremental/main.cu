@@ -42,7 +42,6 @@
 #include "gpu_graph.cuh"
 #include "helper_cuda.h"
 
-// #include "sampler.cuh"
 
 // Maximum steps allowed per random walk (prevents infinite loops)
 #define max_steps 100
