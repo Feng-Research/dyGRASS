@@ -66,7 +66,7 @@ struct EdgeInfo {
       index_t index_a;  // Index of b in a's neighbor list
       index_t index_b;  // Index of a in b's neighbor list  
       weight_t weight;  // Edge weight
-  };
+};
 
 
 class CSRGraph {

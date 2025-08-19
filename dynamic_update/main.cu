@@ -23,26 +23,3 @@
 // #define max_steps 100 // already defined in functions.h
 using namespace std;
 
-__global__ void
-NBRW_decremental(
-    GPU_Dual_Graph * G,
-    GPU_Stream_Edges * stream_edges,
-    int batch_size,
-    int n_steps
-){}
-
-__global__ void
-NBRW_incremental(
-    GPU_Dual_Graph * G,
-    GPU_Stream_Edges * stream_edges,
-    int batch_size,
-    float distortion
-){}
-
-
-__global__ void
-NBRW_heuristic_decremental(
-    GPU_Dual_Graph * G,
-    GPU_Stream_Edges * stream_edges,
-    int batch_size
-){}

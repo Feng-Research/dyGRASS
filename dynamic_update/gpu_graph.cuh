@@ -32,12 +32,19 @@ static void HandleError( cudaError_t err,
     }
 }
 
+
 // Macro for convenient error checking: H_ERR(cudaMalloc(...))
 #define H_ERR( err )(HandleError( err, __FILE__, __LINE__ ))
 
 
 # define DENSE 0
 # define SPARSE 1
+
+struct ValueIndex {
+      float value;
+      int index;
+};
+
 
 class GPU_Stream_Edges{
 
@@ -171,7 +178,7 @@ class GPU_Stream_Edges{
             HRR(cudaMemcpy(path_selected_flag, path_selected_flag_device, sizeof(int) * load_size, cudaMemcpyDeviceToHost));
         }
 
-        void heuristicRecovery(){
+        void heuristicRecovery(GPU_Dual_Graph * ggraph){
             if (this->heuristic_sample_num == 0) {
                 cout << "Wrong call to heuristicRecovery()" << endl;
                 return;
@@ -179,9 +186,11 @@ class GPU_Stream_Edges{
                 HRR(cudaMemcpy(heuristic_sample_nodes_device, heuristic_sample_nodes, sizeof(vertex_t) * heuristic_sample_num * 2, cudaMemcpyHostToDevice));
                 // Launch heuristic recovery kernel here
                 //TODO: launch heuristicRecoveryKernel<<<grid, block>>>(...);
-                int size =  heuristic_sample_num * 3 * 16;
+                int size =  heuristic_sample_num * 2 * 2 * 16;
                 assert(size  < load_size * n_steps);
                 HRR(cudaMemcpy(path_selected_device, path_selected, sizeof(vertex_t) * size , cudaMemcpyHostToDevice));
+                NBRW_heuristic_decremental<<<heuristic_sample_num * 2, 16>>>(ggraph, this);
+                HRR(cudaMemcpy(path_selected_device, path_selected, sizeof(vertex_t) * size, cudaMemcpyDeviceToHost));
             }
         }
 
@@ -471,7 +480,25 @@ class GPU_Dual_Graph{
 
         }
 
+        void edgeInsertionForHeuristic(vertex_t a, vertex_t b){
 
+            if (a > b) swap(a, b);
+            long key = a * this->multiplier + b;
+
+            
+            if (this->graph_map[DENSE]->count(key) == 0){
+                cerr << "Error: Edge not exist in dense graph, cannot insert for heuristic: " << a << " " << b << endl;
+            } else{
+                weight_t weight = this->graph_map[DENSE]->at(key).weight;
+
+                if (this->graph_map[SPARSE]->count(key) == 0){
+                     edgeInsertion(a, b, weight, SPARSE);
+                }
+                    
+            }
+
+
+        }
 
 
         void edgeDeletion(vertex_t a, vertex_t b, int graph_type){
@@ -525,7 +552,7 @@ class GPU_Dual_Graph{
             }
         }
 
-
+        
         void updateSparsiferFromResult(GPU_Stream_Edges & g_stream_edges){
 
             int count = 0;
@@ -538,7 +565,7 @@ class GPU_Dual_Graph{
             if (g_stream_edges.current_op == INCREMENTAL){
                 // for incremental, just add all found edges to sparse graph
                 for (int i = 0; i < batch_size; i++){
-                    if (g_stream_edges.path_selected_flag[i] == 1){
+                    if (g_stream_edges.path_selected_flag[i] != -1){
                         vertex_t a = g_stream_edges.edges[start_index + i * 2];
                         vertex_t b = g_stream_edges.edges[start_index + i * 2 + 1];
                         weight_t w = g_stream_edges.weights[start_index + i];
@@ -599,16 +626,17 @@ class GPU_Dual_Graph{
             if(decremental_no_found_count > 0){
                 cout << "Not implemented yet" << endl;
                 cout << "Heuristic recovery needed for " << decremental_no_found_count << " edges." <<  endl;
-                g_stream_edges.heuristicRecovery();
+                g_stream_edges.heuristicRecovery(this);
                 
-                // for (int i = 0; i < decremental_no_found_count; i++){
+                for (int i = 0; i < decremental_no_found_count * 2; i++){
                     
-                //     vertex_t a = g_stream_edges.heuristic_sample_nodes[i * 2];
-                //     vertex_t b = g_stream_edges.heuristic_sample_nodes[i * 2 + 1];
+                    vertex_t a = g_stream_edges.heuristic_sample_nodes[i * 2];
+                    vertex_t b = g_stream_edges.path_selected[i * 2];
+                    vertex_t c = g_stream_edges.path_selected[i * 2 + 1];
 
-
-                //     int path_length = 3;
-                // }
+                    this->edgeInsertionForHeuristic(a, b);
+                    this->edgeInsertionForHeuristic(b, c);
+                }
                     
             }
 
@@ -640,5 +668,312 @@ class GPU_Dual_Graph{
 };
 
 
+__global__ void
+NBRW_decremental(
+    GPU_Dual_Graph * G,
+    GPU_Stream_Edges * stream_edges,
+    int batch_size,
+    int n_steps
+){
+
+    __shared__ ValueIndex sharedData[32];
+    int tid = blockIdx.x * blockDim.x + threadIdx.x;
+
+    curandState local_state;
+    curand_init(tid, 10, 7, &local_state);
+
+    unsigned int sourceIndex = stream_edges->edges_device[blockIdx.x * 2];
+    unsigned int targetIndex = stream_edges->edges_device[blockIdx.x * 2 + 1];
+
+    unsigned int currentVertex = sourceIndex;
+    unsigned int previousVertex = 0;
+    int targetFoundAt = -1; // TODO: make sure use same count as CPU side
+    int step_count = 0;
+
+    unsigned int path [max_steps];
+    float total_R = 0;
+
+    // firtst step don't need consider previous vertex
+    unsigned int degree = G->degree_list_device[DENSE][currentVertex];
+    unsigned int bin_size = G->bin_size_device[DENSE][currentVertex];
+    weight_t * neighbors = G->beg_ptr_device[DENSE][currentVertex];
+    unsigned int next = curand(&local_state) % degree;
+    unsigned int nextVertex = static_cast<unsigned int>(neighbors[next]);
+    float resistance = 1 / neighbors[bin_size + next];
+    total_R += resistance;
+    path[step_count] = nextVertex;
+    
+
+    if (nextVertex != targetIndex){
+
+        previousVertex = currentVertex;
+        currentVertex = nextVertex;
+        step_count ++;
+
+        while (step_count < n_steps){
+
+            degree = G->degree_list_device[DENSE][currentVertex];
+            if (degree == 1){
+                break;
+            }
+            if (degree == 0){
+                printf("Error: degree zero node encountered in NBRW_decremental\n");
+                break;
+            }
+
+            bin_size = G->bin_size_device[DENSE][currentVertex];
+            neighbors = G->beg_ptr_device[DENSE][currentVertex];
+            next = curand(&local_state) % (degree - 1);
+            nextVertex = static_cast<unsigned int>(neighbors[next]);
+
+            if (nextVertex == previousVertex){
+                nextVertex = static_cast<unsigned int>(neighbors[degree - 1]);
+                resistance  = 1 / neighbors[bin_size + degree - 1];
+            } else {
+                resistance  = 1 / neighbors[bin_size + next];
+            }
+
+            path[step_count] = nextVertex;
+            total_R += resistance;
+
+            if (nextVertex == targetIndex){
+                targetFoundAt = step_count;
+                break;
+            }
+
+            previousVertex = currentVertex;
+            currentVertex = nextVertex;
+            step_count ++;
+        }
+
+    } else{
+
+        targetFoundAt = step_count;
+    }
+
+    ValueIndex result;
+    if (targetFoundAt != -1) {
+        result = {total_R, (int)threadIdx.x};
+    }else{
+        result = {__FLT_MAX__, -1};
+    }
+    
+    __syncthreads();
+
+    ValueIndex minResult = blockReduceMin(result, sharedData);
+
+    if (threadIdx.x == 0) {
+       sharedData[0] = minResult;
+    }
+
+    __syncthreads();
+
+    if (threadIdx.x == sharedData[0].index) {
+        if (targetFoundAt != -1) {
+            stream_edges->path_selected_flag_device[blockIdx.x] = targetFoundAt;
+
+            for (int i = 0; i <= targetFoundAt; i++) {
+                stream_edges->path_selected_device[blockIdx.x * n_steps + i] = path[i];
+            }
+        }else{
+            stream_edges->path_selected_flag_device[blockIdx.x] = -1;
+        }
+
+    }
+
+}
+
+__global__ void
+NBRW_incremental(
+    GPU_Dual_Graph * G,
+    GPU_Stream_Edges * stream_edges,
+    int batch_size,
+    float distortion
+){  
+    __shared__ ValueIndex sharedData[32];
+    int tid = blockIdx.x * blockDim.x + threadIdx.x;
+
+    curandState local_state;
+    curand_init(tid, 10, 7, &local_state);
+
+    unsigned int sourceIndex = stream_edges->edges_device[blockIdx.x * 2];
+    unsigned int targetIndex = stream_edges->edges_device[blockIdx.x * 2 + 1];
+    float edge_weight = stream_edges->weights_device[blockIdx.x];
+
+    unsigned int currentVertex = sourceIndex;
+    unsigned int previousVertex = 0;
+    int targetFoundAt = -1;
+    int step_count = 0;
+
+    float total_R = 0;
+
+    // first neighbor
+    unsigned int degree = G->degree_list_device[SPARSE][currentVertex];
+    unsigned int bin_size = G->bin_size_device[SPARSE][currentVertex];
+    weight_t * neighbors = G->beg_ptr_device[SPARSE][currentVertex];
+    unsigned int next = curand(&local_state) % degree;
+    unsigned int nextVertex = static_cast<unsigned int>(neighbors[next]);
+    float resistance = 1 / neighbors[bin_size + next];
+    total_R += resistance;
+
+    if (nextVertex != targetIndex){
+
+        previousVertex = currentVertex;
+        currentVertex = nextVertex;
+        step_count ++;
+
+        while (step_count < max_steps){
+
+            degree = G->degree_list_device[SPARSE][currentVertex];
+            if (degree == 1){
+                break;
+            }
+            if (degree == 0){
+                printf("Error: degree zero node encountered in NBRW_incremental\n");
+                break;
+            }
+
+            bin_size = G->bin_size_device[SPARSE][currentVertex];
+            neighbors = G->beg_ptr_device[SPARSE][currentVertex];
+            next = curand(&local_state) % (degree - 1);
+            nextVertex = static_cast<unsigned int>(neighbors[next]);
+
+            if (nextVertex == previousVertex){
+                nextVertex = static_cast<unsigned int>(neighbors[degree - 1]);
+                resistance  = 1 / neighbors[bin_size + degree - 1];
+            } else {
+                resistance  = 1 / neighbors[bin_size + next];
+            }
+
+            total_R += resistance;
+
+            //Termination conditions
+            if (total_R * edge_weight >= distortion) {
+                break;
+            }
+
+            if (nextVertex == targetIndex){
+                targetFoundAt = step_count;
+                break;
+            }
+
+            previousVertex = currentVertex;
+            currentVertex = nextVertex;
+            step_count ++;
+        }
+
+    }else{
+        targetFoundAt = step_count;
+    }
+
+    ValueIndex result;
+    if (targetFoundAt != -1) {
+        result = {total_R, (int)threadIdx.x};
+    }else{
+        result = {__FLT_MAX__, -1};
+    }
+
+    __syncthreads();
+
+    ValueIndex minResult = blockReduceMin(result, sharedData);
+
+    if (threadIdx.x == 0) {
+       sharedData[0] = minResult;
+    }
+
+    __syncthreads();
+
+    if (threadIdx.x == sharedData[0].index) {
+        if (targetFoundAt != -1) {
+            stream_edges->path_selected_flag_device[blockIdx.x] = targetFoundAt;
+
+        }else{
+            stream_edges->path_selected_flag_device[blockIdx.x] = -1;
+        }
+
+    }
+
+}
+
+
+__global__ void
+NBRW_heuristic_decremental(
+    GPU_Dual_Graph * G,
+    GPU_Stream_Edges * stream_edges
+){
+    int tid = threadIdx.x + blockIdx.x * blockDim.x;
+
+    curandState local_state;
+    curand_init(tid, 10, 7, &local_state);
+
+    unsigned int sourceIndex = stream_edges->heuristic_sample_nodes_device[tid * 2];
+    unsigned int currentVertex = sourceIndex;
+    unsigned int previousVertex = 0;
+    unsigned int path[2];
+
+    unsigned int degree = G->degree_list_device[DENSE][currentVertex];
+    weight_t * neighbors = G->beg_ptr_device[DENSE][currentVertex];
+    unsigned int next  = curand(&local_state) % degree;
+    unsigned int nextVertex = static_cast<unsigned int>(neighbors[next]);
+    path[0] = nextVertex;
+
+    previousVertex = currentVertex;
+    currentVertex = nextVertex;
+
+    degree = G->degree_list_device[DENSE][currentVertex];
+    next = curand(&local_state) % (degree -1);
+    nextVertex = static_cast<unsigned int>(neighbors[next]);
+    
+    if (nextVertex == previousVertex) {
+        nextVertex = static_cast<unsigned int>(neighbors[degree - 1]);
+    }
+    path[2] = nextVertex;
+
+    for (int i = 0; i < 2; i++){
+        stream_edges->path_selected_device[tid * 2 + i] = path[i];
+    }
+
+}
+
+
+__device__ ValueIndex reduceMin(ValueIndex a, ValueIndex b) {
+    return (a.value < b.value) ? a : b;  // Find minimum value
+}
+
+__device__ ValueIndex warpReduceMin(ValueIndex val) {
+    for (int offset = warpSize / 2; offset > 0; offset /= 2) {
+        ValueIndex other;
+        other.value = __shfl_down_sync(0xffffffff, val.value, offset);
+        other.index = __shfl_down_sync(0xffffffff, val.index, offset);
+        val = reduceMin(val, other);  // Changed to reduceMin
+    }
+    return val;
+}
+
+__device__ ValueIndex blockReduceMin(ValueIndex val, ValueIndex* sharedData) {
+    int warp = threadIdx.x / 32;
+    int lane = threadIdx.x % 32;
+
+    // Step 1: Warp-level reduction
+    val = warpReduceMin(val);  // Changed to warpReduceMin
+
+    // Step 2: Store warp results?
+    if (lane == 0) {
+        sharedData[warp] = val;
+    }
+    __syncthreads();
+
+    // Step 3: Final reduction among warps
+    if (warp == 0) {  // Only first warp
+          if (threadIdx.x < blockDim.x / 32) {
+              val = sharedData[threadIdx.x];  // Load valid data
+          } else {
+              val = {__FLT_MAX__, -1};        // Safe initialization
+          }
+          val = warpReduceMin(val);  // Now safe - all threads have valid data
+      }
+
+    return val; // Thread 0 has minimum value with corresponding index and step
+}
 
 #endif
