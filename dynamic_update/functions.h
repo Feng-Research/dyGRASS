@@ -72,6 +72,7 @@ struct EdgeInfo {
 class CSRGraph {
     public:
     // === Core CSR representation ===
+    int base;
     vector<vertex_t> adj;        // Flattened adjacency list: neighbors of all vertices
     vector<weight_t> weight;     // Edge weights corresponding to adj entries
     vector<index_t> begin;       // Starting index in adj array for each vertex
@@ -168,22 +169,23 @@ class EdgeStream {
     EdgeStream(const string& folder, int base);
     
 
-    ~EdgeStream() {
-        cout << "EdgeStream deleted. Processed " << total_edges_processed << " total edges." << endl;
-    }
-    
-
     bool loadNextBatch();
 
     bool autoDetectWeightExist(const string& filename);
 
     void loadBatchFromFile(const string& filename, OperationType op);
-    
+
+    ~EdgeStream() {
+        cout << "EdgeStream deleted." << endl;
+    }
+
 
 };
 
 
 
 GraphInfo auto_detect_graph_info(const char* filename);
+
+string getCurrentTimestamp();
 
 #endif

@@ -45,6 +45,17 @@ struct ValueIndex {
       int index;
 };
 
+// Forward declarations
+class GPU_Dual_Graph;
+class GPU_Stream_Edges;
+
+// Kernel declarations (must be before class method implementations)
+__global__ void NBRW_heuristic_decremental(GPU_Dual_Graph* G, GPU_Stream_Edges* stream_edges);
+
+// Device function declarations
+__device__ ValueIndex reduceMin(ValueIndex a, ValueIndex b);
+__device__ ValueIndex warpReduceMin(ValueIndex val);
+__device__ ValueIndex blockReduceMin(ValueIndex val, ValueIndex* sharedData);
 
 class GPU_Stream_Edges{
 
@@ -162,20 +173,43 @@ class GPU_Stream_Edges{
                 this->load_size = this->batch_size - this->next_run_index;  
             }
 
-            this->next_run_index += this->load_size;
-
+            // Copy FIRST using current index
             HRR(cudaMemcpy(edges_device, edges + (next_run_index * 2), sizeof(vertex_t) * load_size * 2, cudaMemcpyHostToDevice));
             if (this->current_op == INCREMENTAL){
                 HRR(cudaMemcpy(weights_device, weights + next_run_index, sizeof(weight_t) * load_size, cudaMemcpyHostToDevice));
             }
+            
+            // THEN increment for next iteration
+            this->next_run_index += this->load_size;
 
         }
 
         void downloadResult(){
+            cout << "DEBUG downloadResult: load_size=" << load_size << ", max_capacity=" << max_capacity << endl;
+            cout << "DEBUG downloadResult: current_op=" << current_op << ", n_steps=" << n_steps << endl;
+            
+            // Synchronize GPU to make sure kernel completed
+            cudaDeviceSynchronize();
+            
+            // Check for kernel execution errors
+            cudaError_t kernelError = cudaGetLastError();
+            if (kernelError != cudaSuccess) {
+                cout << "CUDA Kernel Error: " << cudaGetErrorString(kernelError) << endl;
+                return;
+            }
+            
+            if (load_size > max_capacity) {
+                cout << "ERROR: load_size > max_capacity!" << endl;
+                return;
+            }
+            
             if (this->current_op == DECREMENTAL){
+                cout << "DEBUG: Copying decremental results..." << endl;
                 HRR(cudaMemcpy(path_selected, path_selected_device, sizeof(int) * load_size * n_steps, cudaMemcpyDeviceToHost));
             }
+            cout << "DEBUG: Copying path_selected_flag..." << endl;
             HRR(cudaMemcpy(path_selected_flag, path_selected_flag_device, sizeof(int) * load_size, cudaMemcpyDeviceToHost));
+            cout << "DEBUG: downloadResult completed successfully" << endl;
         }
 
         void heuristicRecovery(GPU_Dual_Graph * ggraph){
@@ -185,7 +219,6 @@ class GPU_Stream_Edges{
             } else {
                 HRR(cudaMemcpy(heuristic_sample_nodes_device, heuristic_sample_nodes, sizeof(vertex_t) * heuristic_sample_num * 2, cudaMemcpyHostToDevice));
                 // Launch heuristic recovery kernel here
-                //TODO: launch heuristicRecoveryKernel<<<grid, block>>>(...);
                 int size =  heuristic_sample_num * 2 * 2 * 16;
                 assert(size  < load_size * n_steps);
                 HRR(cudaMemcpy(path_selected_device, path_selected, sizeof(vertex_t) * size , cudaMemcpyHostToDevice));
@@ -223,7 +256,6 @@ class GPU_Dual_Graph{
         
         //incremental
         //decremental
-        index_t * wait_add_edges;
 
         // try new thing
         index_t edge_num[2];
@@ -283,7 +315,9 @@ class GPU_Dual_Graph{
 
                 this->extra_neighbor_data[graph_type] = this->concatenated_neighbors_data[graph_type] + this->edge_num[graph_type]*2;
                 this->extra_neighbor_data_device[graph_type] = this->concatenated_neighbors_data_device[graph_type] + offset;
-                assert(extra_neighbor_data_device == concatenated_neighbors_data_device + this->edge_num[graph_type]*2);
+                
+                     
+                assert(extra_neighbor_data_device[graph_type] == concatenated_neighbors_data_device[graph_type] + this->edge_num[graph_type]*2);
                 this->extra_neighbor_offset[graph_type] = 0;
 
                 
@@ -322,6 +356,7 @@ class GPU_Dual_Graph{
         void preprocessStreamEdges(EdgeStream & stream_edges){
 
             OperationType op = stream_edges.current_op;
+            int delete_count = 0;
 
             auto it = stream_edges.batch_edges.begin();
             while(it != stream_edges.batch_edges.end()){
@@ -336,6 +371,7 @@ class GPU_Dual_Graph{
                         // edge already exist so add weights to exist edges
                         cout << "Warning: Incremental Edge already exists in original graph, skip: " << u << " " << v << endl;
                         it = stream_edges.batch_edges.erase(it);
+                        ++delete_count;
 
                         // do edge weights update here, in the function automatically check sparsifier  has this edge or not
                         this->dualGraphEdgeweightsUpdate(u, v, w);
@@ -361,6 +397,7 @@ class GPU_Dual_Graph{
                         // edge not exist in original graph, just skip it
                         cout << "Warning: Decremental Edge not exist in original graph, skip: " << u << " " << v << endl;
                         it = stream_edges.batch_edges.erase(it);
+                        ++delete_count;
 
                         if (this->graph_map[SPARSE]->count(key) > 0) {
                             // illegal state
@@ -381,12 +418,17 @@ class GPU_Dual_Graph{
                         } else {
                             // edge not exist in sparsifer, just remove it from dense, not need NBRW
                             it = stream_edges.batch_edges.erase(it);
+                            ++delete_count;
                         }
                         
                     }
 
                 }
             }
+
+            cout << "Filtered out " << delete_count << " edges during initial check." << endl;
+            stream_edges.batch_size -= delete_count;
+
             // update to GPU
             this->updateDeviceDualGraph();
         }
@@ -586,7 +628,6 @@ class GPU_Dual_Graph{
                     if (path_length != 0){
                         
                         int path_start = i * g_stream_edges.n_steps;
-                        vertex_t from = a;
 
                         for (int j = 0; j < path_length; j++){
 
@@ -642,37 +683,66 @@ class GPU_Dual_Graph{
 
         }
         
+        void save_result(string folder_name){
+            
+            system(("mkdir -p " + folder_name).c_str());
+            string dense_path = folder_name + "/adj_dense.mtx";
+            string sparse_path = folder_name + "/adj_sparse.mtx";
+            
+            // Save dense graph
+            std::ofstream dense_file(dense_path, std::ios::out);
+            if(dense_file.is_open()){
+                dense_file << "%%MatrixMarket matrix coordinate real general\n";
+                dense_file << vertex_num << " " << vertex_num << " " << edge_num[DENSE] << "\n";
 
- 
-       
-        void sparse_map_to_1_based_mtx(string file_name){
-            // std::ofstream txt_file(file_name, std::ios::out);
-            // if(txt_file.is_open()){
-            //     for(auto it = sparse_map->begin(); it != sparse_map->end(); ++it){
+                for (const auto& [key, edge_info] : *graph_map[DENSE]) {  // C++17 structured binding
+                    vertex_t u = key / multiplier;
+                    vertex_t v = key % multiplier;
+                    dense_file << (u + 1) << " " << (v + 1) << " " << edge_info.weight << "\n";
+                }
+                dense_file.close();
+                cout << "Dense graph saved to " << dense_path << endl;
+            }
 
-            //         auto key = it->first;
-            //         long a = key / this->multiplier;
-            //         long b = key % this->multiplier;
-            //         txt_file << a + 1 << " " << b + 1 << " " << 1 << std::endl;
-            //     }
-            // }
-            // cout<< "Updated sparse mtx file saved to: " << file_name << endl; 
-                
+            // Save sparse graph
+            std::ofstream sparse_file(sparse_path, std::ios::out);
+            if(sparse_file.is_open()){
+                sparse_file << "%%MatrixMarket matrix coordinate real general\n";
+                sparse_file << vertex_num << " " << vertex_num << " " << edge_num[SPARSE] << "\n";
+
+                for (const auto& [key, edge_info] : *graph_map[SPARSE]) {
+                    vertex_t u = key / multiplier;
+                    vertex_t v = key % multiplier;
+                    sparse_file << (u + 1) << " " << (v + 1) << " " << edge_info.weight << "\n";
+                }
+                sparse_file.close();
+                cout << "Sparse graph saved to " << sparse_path << endl;
+            }
         }
 
 
+
         ~GPU_Dual_Graph(){ 
+            for (int graph_type = 0; graph_type < 2; graph_type++){
+                delete[] this->bin_size[graph_type];
+                delete[] this->beg_ptr[graph_type];
+                delete[] this->concatenated_neighbors_data[graph_type];
+                delete[] this->beg_ptr_device_content[graph_type];
+                cudaFree(degree_list_device[graph_type]);
+                cudaFree(bin_size_device[graph_type]);
+                cudaFree(beg_ptr_device[graph_type]);
+                cudaFree(concatenated_neighbors_data_device[graph_type]);
+            }
+
+            cout << "GPU_Dual_Graph deallocated" << endl;
             
         }
         
 };
 
-
-__global__ void
-NBRW_decremental(
+__global__ void NBRW_decremental(
     GPU_Dual_Graph * G,
     GPU_Stream_Edges * stream_edges,
-    int batch_size,
     int n_steps
 ){
 
@@ -783,12 +853,11 @@ NBRW_decremental(
 
 }
 
-__global__ void
-NBRW_incremental(
+__global__ void NBRW_incremental(
     GPU_Dual_Graph * G,
     GPU_Stream_Edges * stream_edges,
-    int batch_size,
-    float distortion
+    float distortion,
+    int n_steps
 ){  
     __shared__ ValueIndex sharedData[32];
     int tid = blockIdx.x * blockDim.x + threadIdx.x;
@@ -799,6 +868,12 @@ NBRW_incremental(
     unsigned int sourceIndex = stream_edges->edges_device[blockIdx.x * 2];
     unsigned int targetIndex = stream_edges->edges_device[blockIdx.x * 2 + 1];
     float edge_weight = stream_edges->weights_device[blockIdx.x];
+
+    // Debug: Print suspicious values
+    // if (blockIdx.x < 5 && threadIdx.x == 0) {
+    //     printf("DEBUG kernel block %d: src=%u, tgt=%u, vertex_num=%u\n", 
+    //            blockIdx.x, sourceIndex, targetIndex, G->vertex_num);
+    // }
 
     unsigned int currentVertex = sourceIndex;
     unsigned int previousVertex = 0;
@@ -811,6 +886,12 @@ NBRW_incremental(
     unsigned int degree = G->degree_list_device[SPARSE][currentVertex];
     unsigned int bin_size = G->bin_size_device[SPARSE][currentVertex];
     weight_t * neighbors = G->beg_ptr_device[SPARSE][currentVertex];
+    
+    // Debug: Print degree info for first few blocks
+    if (blockIdx.x < 5 && threadIdx.x == 0) {
+        printf("DEBUG kernel block %d: currentVertex=%u, degree=%u, bin_size=%u\n", 
+               blockIdx.x, currentVertex, degree, bin_size);
+    }
     unsigned int next = curand(&local_state) % degree;
     unsigned int nextVertex = static_cast<unsigned int>(neighbors[next]);
     float resistance = 1 / neighbors[bin_size + next];
@@ -822,7 +903,7 @@ NBRW_incremental(
         currentVertex = nextVertex;
         step_count ++;
 
-        while (step_count < max_steps){
+        while (step_count < n_steps){
 
             degree = G->degree_list_device[SPARSE][currentVertex];
             if (degree == 1){
@@ -896,8 +977,7 @@ NBRW_incremental(
 }
 
 
-__global__ void
-NBRW_heuristic_decremental(
+__global__ void NBRW_heuristic_decremental(
     GPU_Dual_Graph * G,
     GPU_Stream_Edges * stream_edges
 ){

@@ -170,6 +170,81 @@ function V_size(ar)
     return mx
 end
 
+function checkBase(file_path)
+    """
+    Determines if a graph file uses 0-based or 1-based vertex indexing by examining all vertices.
+    
+    Args:
+        file_path: Path to the graph file (MTX format or edge list)
+    
+    Returns:
+        0 if 0-based indexing (minimum vertex index is 0)
+        1 if 1-based indexing (minimum vertex index is 1)
+        nothing if file doesn't exist or is empty
+    """
+    if !isfile(file_path)
+        println("File $file_path does not exist.")
+        return nothing
+    end
+
+    min_vertex = typemax(Int)  # Start with maximum possible integer
+    line_count = 0
+    
+    try
+        open(file_path, "r") do f
+            for line in eachline(f)
+                # Skip comment lines (starting with %)
+                if startswith(strip(line), "%") || isempty(strip(line))
+                    continue
+                end
+                
+                line_count += 1
+                parts = split(strip(line))
+                
+                # Handle both 2-column (unweighted) and 3-column (weighted) formats
+                if length(parts) >= 2
+                    try
+                        # Parse first two columns as vertex indices
+                        v1 = parse(Int, parts[1])
+                        v2 = parse(Int, parts[2])
+                        
+                        # Update minimum vertex index
+                        min_vertex = min(min_vertex, v1, v2)
+                        
+                        # Early termination: if we find 0, we know it's 0-based
+                        if min_vertex == 0
+                            return 0
+                        end
+                    catch ArgumentError
+                        # Skip lines that don't contain valid integers
+                        continue
+                    end
+                end
+            end
+        end
+        
+        # If no valid lines were processed
+        if line_count == 0 || min_vertex == typemax(Int)
+            println("Warning: No valid edge data found in file $file_path")
+            return nothing
+        end
+        
+        # Return based on minimum vertex found
+        if min_vertex == 0
+            return 0  # 0-based indexing
+        elseif min_vertex == 1
+            return 1  # 1-based indexing
+        else
+            println("Warning: Minimum vertex index is $min_vertex, expected 0 or 1")
+            return min_vertex >= 1 ? 1 : 0
+        end
+        
+    catch e
+        println("Error reading file $file_path: $e")
+        return nothing
+    end
+end
+
 function checkMtxProp(file_path)
     if !isfile(file_path)
         println("File $file_path does not exist.")
@@ -189,7 +264,8 @@ function checkMtxProp(file_path)
             println("Warning: Treat as lap, but maybe is a self-loop in adjacency matrix.")
             return ("lap", true)  # treat as adjacency if self-loop found
         else
-            if line_data[3] < 0
+            w = parse(Float64, line_data[3])
+            if w < 0
                 return ("lap", true)  # treat as lap if negative weights found
             else
                 return ("adj", true)  # treat as adjacency if no self-loop and no negative weights
@@ -348,6 +424,20 @@ function prepareDecremental(graph_name)
 
     saveEXT(dense_edges, dense_weights, "../dataset/" * graph_name * "/updated_dense.mtx")
 
+end
+
+function makeSureAdjOneBase(folder, file_name, new_file_name)
+    if !isdir(folder)
+        error("Folder $folder does not exist.")
+    end
+
+    original_file = folder * "/" * file_name
+    g_type, is_weighted = checkMtxProp(original_file)
+    base = checkBase(original_file)
+    edges, weights = readMtx(original_file, base = base, type = g_type, weighted = is_weighted)
+    
+    @assert minimum(Iterators.flatten(edges)) == 1
+    saveEXT(edges, weights, folder * "/" * new_file_name; base_zero = false)
 end
 
 function read_del_edges(graph_name; percentage = 1.0)
@@ -790,6 +880,33 @@ function single_graph_iter_exp(graph_name, CND)
 
 end
 
+function test_checkBase()
+    """
+    Test the checkBase function with sample data
+    """
+    println("Testing checkBase function...")
+    
+    # Test with existing dataset files if available
+    dataset_dirs = ["../dataset"]
+    for dir in dataset_dirs
+        if isdir(dir)
+            for subdir in readdir(dir; join=true)
+                if isdir(subdir)
+                    # Look for common graph file patterns
+                    for filename in ["dense.mtx", "adj_sparse.mtx", "ext.mtx"]
+                        filepath = joinpath(subdir, filename)
+                        if isfile(filepath)
+                            base = checkBase(filepath)
+                            println("File: $filepath -> Base: $base")
+                        end
+                    end
+                end
+            end
+        end
+    end
+end
+
 function test()
-println("Testing dyGRASS.jl module...")
+    println("Testing dyGRASS.jl module...")
+    test_checkBase()
 end

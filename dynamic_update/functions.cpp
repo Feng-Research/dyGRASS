@@ -12,6 +12,9 @@
 #include <dirent.h> // for directory operations
 #include <algorithm> // for sort
 #include <regex> // for filename parsing
+#include <chrono>
+#include <iomanip> // for std::put_time
+#include <sstream> // for std::stringstream
 #include "functions.h"
 using namespace std;
 
@@ -312,6 +315,9 @@ CSRGraph::CSRGraph(const char* filename) {
     int base = info.base;
     vertex_t v_max_prev = info.v_max;
     vertex_t v_min_prev = info.v_min;
+    
+
+    this->base = base; // Set base for 0/1-based indexing
 
     // === File I/O Setup with Memory Mapping ===
     int fd = open(filename, O_RDONLY);  // Open file in read-only mode
@@ -344,7 +350,7 @@ CSRGraph::CSRGraph(const char* filename) {
     // This pass scans the entire file to:
     // 1. Count total number of edges (for memory allocation)
     // 2. Find min/max vertex IDs (to determine graph size)
-
+    
     while (next < file_size) {
         
         this->line_count++;
@@ -370,6 +376,9 @@ CSRGraph::CSRGraph(const char* filename) {
 
         if (is_laplacian && src == dest) {
             // Skip diagonal in Laplacian matrix
+            // if (this->line_count <= 5) {
+            //     cout << "DEBUG: Skipping diagonal edge src=" << src << ", dest=" << dest << endl;
+            // }
             continue;
         }
         v_max = max(v_max, src);
@@ -379,18 +388,25 @@ CSRGraph::CSRGraph(const char* filename) {
         v_min = min(v_min, dest);
         this->edge_count++;
         
+        
     }
 
     // === Initialize Enhanced CSR Graph Structure ===
     
-    // Edge count depends on whether we're creating undirected graph (with reverse edges)
-    this->edge_count = is_reverse ? edge_count << 1 : edge_count;
-    this->vert_count = v_max + 1 - base; // auto determined by base
+    // Edge count depends on whether we're creating undirected graph (with reverse edges)  
+    this->edge_count = is_reverse ? this->edge_count << 1 : this->edge_count;
+    
+    // Use the detection phase values (already found correct range)
+
+    assert(v_max_prev - base == v_max);
+    assert(v_min_prev - base == v_min);
     this->v_max = v_max;
     this->v_min = v_min;
 
-    assert(v_max == v_max_prev && v_min == v_min_prev);
-    assert(v_min == base);
+    this->vert_count = this->v_max + 1;  // 0-based vertex count
+    
+    // Verify the conversion worked correctly
+    assert(this->v_min == 0);  // Should be 0 after conversion
     // Calculate multiplier for edge mapping hash keys
     // This ensures (src * multiplier + dest) produces unique keys for all vertex pairs
     int digit_num = findDigitsNum(vert_count);
@@ -400,6 +416,7 @@ CSRGraph::CSRGraph(const char* filename) {
     this->begin.resize(this->vert_count + 1, 0);  // CSR begin array (vert_count+1 for easier indexing)
     this->adj.resize(this->edge_count);           // Adjacency list (all neighbors concatenated)
     this->weight.resize(this->edge_count);        // Edge weights corresponding to adj entries
+    
     this->degree.resize(this->vert_count, 0);     // Vertex degrees (will be recalculated)
     this->from.resize(this->edge_count);          // Original edge index mapping
     // this->mtx.resize(line_count);                 // Original edge tuples (src, dest, weight)
@@ -435,6 +452,14 @@ CSRGraph::CSRGraph(const char* filename) {
             // Skip diagonal in Laplacian matrix
             continue;
         }
+        
+        // Debug: Check bounds before accessing
+        if (src >= this->vert_count || dest >= this->vert_count) {
+            cout << "ERROR: Out of bounds access!" << endl;
+            cout << "src=" << src << ", dest=" << dest << ", vert_count=" << this->vert_count << endl;
+            exit(-1);
+        }
+        
         this->degree[src]++;  // Source vertex gains an outgoing edge
         if (is_reverse) this->degree[dest]++;  // If triangle, dest also gains outgoing edge
     }
@@ -494,6 +519,8 @@ CSRGraph::CSRGraph(const char* filename) {
         // Insert edge src->dest into CSR adjacency list
         // Position: begin[src] + current_degree[src] gives next available slot
         index_t pos_src = this->begin[src] + this->degree[src];
+        
+        
         this->adj[pos_src] = dest;              // Store destination vertex
         this->from[pos_src] = offset;           // Map back to original edge index
         this->reverse[pos_src] = this->degree[dest];  // Store current degree of destination
@@ -785,10 +812,15 @@ bool EdgeStream::autoDetectWeightExist(const string& filename) {
     }
 }
 
-
-EdgeStream::~EdgeStream() {
-
-    cout << "EdgeStream cleanup complete." << endl;
+string getCurrentTimestamp() {
+    auto now = std::chrono::system_clock::now();
+    auto time_t = std::chrono::system_clock::to_time_t(now);
+    
+    char buffer[80];
+    struct tm* timeinfo = std::localtime(&time_t);
+    strftime(buffer, sizeof(buffer), "%Y%m%d_%H%M%S", timeinfo);
+    
+    return string(buffer);
 }
 
  

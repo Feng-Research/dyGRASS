@@ -1,0 +1,5 @@
+set cuda break_on_launch all
+run G2 100
+yes
+c
+quit
