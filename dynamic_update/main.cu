@@ -221,9 +221,13 @@ int main(int argc, char *argv[]){
     }
 
     cout << "\n╔══════════════════════════════════════════════════════════════════════════════════╗" << endl;
-    cout << "║                                PROCESSING COMPLETE                                ║" << endl;
+    cout << "║                                PROCESSING COMPLETE                               ║" << endl;
     cout << "║                                                                                  ║" << endl;
-    cout << "║ Total Kernel Runtime: " << std::fixed << std::setprecision(3) << std::setw(8) << total_kernel_time << " seconds" << std::setw(34) << "║" << endl;
+    // Create properly aligned total kernel runtime line (total width = 85 chars including both borders)
+    ostringstream runtime_stream;
+    runtime_stream << std::fixed << std::setprecision(3) << total_kernel_time;
+    string runtime_line = "║ Total Kernel Runtime: " + runtime_stream.str() + " seconds";
+    cout << runtime_line << string(85 - runtime_line.length(), ' ') << "║" << endl;
     cout << "╚══════════════════════════════════════════════════════════════════════════════════╝" << endl;
     
     // Prompt user to check final graph properties
@@ -232,7 +236,7 @@ int main(int argc, char *argv[]){
     
     if (check_properties == 'y' || check_properties == 'Y') {
         cout << "\n┌─────────────────────────────────────────────────────────────────────────────────┐" << endl;
-        cout << "│                              FINAL GRAPH ANALYSIS                             │" << endl;
+        cout << "│                              FINAL GRAPH ANALYSIS                               │" << endl;
         cout << "└─────────────────────────────────────────────────────────────────────────────────┘" << endl;
         host_graph_ptr->check_current_properties();
     }
