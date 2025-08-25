@@ -1,4 +1,26 @@
+/**
+ * @file functions.cpp
+ * @brief Implementation of core data structures for dynamic graph processing
+ * 
+ * This file implements the main functionality for:
+ * - CSRGraph: Compressed Sparse Row graph representation with efficient edge operations
+ * - EdgeStream: Batch processing of incremental/decremental edge updates
+ * - Graph file format detection and parsing (MTX format with auto-detection)
+ * - Memory-mapped file I/O for efficient large graph processing
+ * 
+ * Key Features:
+ * - Automatic detection of graph file properties (weighted, Laplacian, base index)
+ * - Support for both 0-based and 1-based vertex indexing
+ * - Efficient edge mapping using hash tables for O(1) operations
+ * - Batch processing workflow for dynamic graph updates
+ * - Memory optimization using mmap for large file handling
+ * 
+ * @author Yihang Yuan
+ * @date 2025
+ */
+
 #include <iostream>
+#include <iomanip>
 #include <tuple>
 #include <fstream>
 #include <cmath>  // for pow() in multiplier calculation
@@ -32,6 +54,22 @@ inline off_t fsize(const char *filename) {
     return -1; // Return -1 if file doesn't exist or can't be accessed
 }
 
+/**
+ * @brief Automatically detect graph file format and properties
+ * 
+ * Analyzes an MTX (Matrix Market) format file to determine:
+ * - Header format (Matrix Market comments, dimensions line)
+ * - Whether graph is weighted or unweighted
+ * - Whether graph represents a Laplacian matrix
+ * - Vertex indexing base (0-based or 1-based)
+ * - Whether matrix is triangular or full
+ * - Vertex ID range (min/max values)
+ * 
+ * Uses memory-mapped I/O for efficient parsing of large files.
+ * 
+ * @param filename Path to the MTX format graph file
+ * @return GraphInfo structure containing detected properties
+ */
 GraphInfo auto_detect_graph_info(const char* filename) {
     int fd = open(filename, O_RDONLY);
     if (fd == -1) {
@@ -586,6 +624,19 @@ CSRGraph::CSRGraph(const char* filename) {
     this->degree_list = this->degree.data();
 }
 
+/**
+ * @brief EdgeStream constructor - Initialize batch processing system
+ * 
+ * Sets up the streaming system for processing batches of graph updates.
+ * Scans the specified folder for stream files and sorts them by batch number.
+ * 
+ * Expected file naming convention:
+ * - stream_XXXX_incremental.mtx (for edge additions)
+ * - stream_XXXX_decremental.mtx (for edge deletions)
+ * 
+ * @param folder Path to directory containing stream batch files
+ * @param base Vertex indexing base (0 or 1) for consistency with main graph
+ */
 EdgeStream::EdgeStream(const string& folder, int base) {
     this->base = base;
     this->operations_folder = folder;
@@ -628,6 +679,20 @@ EdgeStream::EdgeStream(const string& folder, int base) {
     }
 }
 
+/**
+ * @brief Load the next batch of edges for processing
+ * 
+ * Advances to the next stream file and loads its edges into memory.
+ * Handles user interaction for batch selection and displays batch information.
+ * 
+ * Features:
+ * - Interactive mode: Prompts user for batch processing decisions
+ * - Auto mode: Processes all batches automatically 
+ * - Incremental-only mode: Stops at first decremental batch
+ * - Beautiful batch headers with operation type and edge count
+ * 
+ * @return true if batch loaded successfully, false if no more batches
+ */
 bool EdgeStream::loadNextBatch() {
     // Reset current batch state
     this->batch_edges.clear();
@@ -641,6 +706,12 @@ bool EdgeStream::loadNextBatch() {
     
     string next_batch_name = batch_names[next_batch_index];
     string next_batch_path = this->operations_folder + "/" + next_batch_name;
+
+    // Beautiful batch header
+    cout << "\n╔══════════════════════════════════════════════════════════════════════════════════╗" << endl;
+    cout << "║                                   BATCH " << std::setw(3) << (next_batch_index + 1) << "                                      ║" << endl;
+    cout << "╚══════════════════════════════════════════════════════════════════════════════════╝" << endl;
+    
 
     cout << "Next stream file: " << next_batch_name << endl;
 
@@ -680,6 +751,7 @@ bool EdgeStream::loadNextBatch() {
             }
         }
     }
+    
     
     // Load the batch file
     cout << "Loading: " << next_batch_path << endl;
@@ -832,6 +904,14 @@ bool EdgeStream::autoDetectWeightExist(const string& filename) {
     }
 }
 
+/**
+ * @brief Generate current timestamp string for output folder naming
+ * 
+ * Creates a timestamp string in YYYYMMDD_HHMMSS format for unique
+ * output directory naming. Used to avoid conflicts between runs.
+ * 
+ * @return Timestamp string (e.g., "20241225_143052")
+ */
 string getCurrentTimestamp() {
     auto now = std::chrono::system_clock::now();
     auto time_t = std::chrono::system_clock::to_time_t(now);

@@ -1,9 +1,47 @@
+/**
+ * @file main.cu
+ * @brief Main driver program for dynamic graph sparsification using GPU-accelerated random walks
+ * 
+ * This program implements the dyGRASS (Dynamic Graph Spectral Sparsification) algorithm
+ * for maintaining sparse approximations of dynamic graphs through incremental and decremental
+ * edge updates using neighborhood-based random walks (NBRW).
+ * 
+ * Program Flow:
+ * 1. Load dense and sparse graph representations from MTX files
+ * 2. Initialize GPU data structures and memory management
+ * 3. Process edge update batches sequentially:
+ *    - Load next batch from stream files  
+ *    - Execute appropriate CUDA kernel (incremental/decremental)
+ *    - Update sparsifier based on random walk results
+ *    - Optionally check graph properties and condition numbers
+ * 4. Generate timestamped output with final results
+ * 
+ * Command Line Usage:
+ *   ./dynamic_update <graph_name> <distortion_threshold> [inc_steps] [dec_steps] [inc_walkers] [dec_walkers]
+ * 
+ * Input Files Expected:
+ *   - ./dataset/<graph_name>/new_adj_dense.mtx (dense graph)
+ *   - ./dataset/<graph_name>/new_adj_sparse.mtx (initial sparse graph)  
+ *   - ./dataset/<graph_name>/stream_edges/ (directory with batch files)
+ * 
+ * Key Features:
+ *   - GPU-accelerated random walk sampling with 512 walkers per edge
+ *   - Interactive batch processing with user prompts
+ *   - Real-time condition number analysis via Julia integration
+ *   - Professional output formatting with timing information
+ *   - Memory-efficient batch processing with overflow handling
+ * 
+ * @author Yihang Yuan
+ * @date 2025
+ */
+
 #include <stdio.h>
 #include <string.h>
 // #include <mpi.h>
 #include <stdlib.h>
 #include <assert.h>
 #include <iostream>
+#include <iomanip>
 #include <sys/types.h>
 #include <sys/socket.h>
 #include <netinet/in.h>
@@ -23,6 +61,22 @@
 // #define max_steps 100 // already defined in functions.h
 using namespace std;
 
+/**
+ * @brief Main function - Dynamic Graph Sparsification Pipeline
+ * 
+ * Orchestrates the complete dynamic sparsification workflow:
+ * 1. Parameter validation and configuration
+ * 2. Graph loading and GPU initialization
+ * 3. Batch processing loop with kernel execution
+ * 4. Results collection and output generation
+ * 
+ * @param argc Argument count (3 or 7 expected)
+ * @param argv Command line arguments:
+ *        argv[1]: Graph name (dataset subdirectory)
+ *        argv[2]: Distortion threshold for random walks
+ *        argv[3-6]: Optional - custom walker counts and step limits
+ * @return 0 on successful completion
+ */
 int main(int argc, char *argv[]){
 
     if(argc != 7 && argc != 3){cout<<"Input: .dynamic_update" 
@@ -90,47 +144,105 @@ int main(int argc, char *argv[]){
     HRR(cudaMalloc(&device_stream_edges_ptr, sizeof(GPU_Stream_Edges)));
     HRR(cudaMemcpy(device_stream_edges_ptr, host_stream_edges_ptr, sizeof(GPU_Stream_Edges), cudaMemcpyHostToDevice));
 
+    int batch_counter = 0;
+    double total_kernel_time = 0.0;
+
+    char check_properties;
+    cout << "Do you want to check initial graph properties? (y/n): ";
+    cin >> check_properties;
+    // check_properties = 'y'; // disable property check by default
+    if (check_properties == 'y' || check_properties == 'Y') {
+        host_graph_ptr->check_current_properties();
+    }
+
     while (edge_stream.loadNextBatch()){
-
-        // Prompt user to check current graph properties
-        char check_properties;
-        cout << "\nDo you want to check current graph properties? (y/n): ";
-        cin >> check_properties;
-        // check_properties = 'y'; // disable property check by default
-        if (check_properties == 'y' || check_properties == 'Y') {
-            host_graph_ptr->check_current_properties();
-        }
-
+        batch_counter++;
+        
+        // Batch header is now printed by loadNextBatch()
+        
         host_graph_ptr->preprocessStreamEdges(edge_stream);
         host_stream_edges_ptr->loadEdgeFromStream(edge_stream);
+        
+        cout << "┌─────────────────────────────────────────────────────────────────────────────────┐" << endl;
+        cout << "│ Processing Batch " << std::setw(2) << batch_counter 
+             << " │ Operation: " << std::setw(11) << (host_stream_edges_ptr->current_op == INCREMENTAL ? "INCREMENTAL" : "DECREMENTAL") 
+             << " │ Edges: " << std::setw(4) << host_stream_edges_ptr->batch_size << " │" << endl;
+        cout << "└─────────────────────────────────────────────────────────────────────────────────┘" << endl;
+
+        // Prompt user to check current graph properties
+        
 
         do {
             host_stream_edges_ptr->loadEdgesToDevice();
             unsigned int n_blockPerGrid = host_stream_edges_ptr->load_size;
 
             if (host_stream_edges_ptr->current_op == INCREMENTAL){
-                cout << "Incremental kernel" << endl;
+                cout << ">>> Incremental kernel is running..." << endl;
+                auto start_time = std::chrono::high_resolution_clock::now();
                 NBRW_incremental<<<n_blockPerGrid,  n_walkers_incremental>>>(device_graph_ptr, device_stream_edges_ptr, distortion, n_steps_incremental);
+                cudaDeviceSynchronize();
+                auto end_time = std::chrono::high_resolution_clock::now();
+                auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(end_time - start_time);
+                double kernel_time = duration.count() / 1000.0;
+                total_kernel_time += kernel_time;
+                cout << ">>> Incremental kernel completed in " << std::fixed << std::setprecision(3) << kernel_time << " seconds" << endl;
             }else if (host_stream_edges_ptr->current_op == DECREMENTAL){
-                cout << "Decremental kernel" << endl;
+                cout << ">>> Decremental kernel is running..." << endl;
+                auto start_time = std::chrono::high_resolution_clock::now();
                 NBRW_decremental<<<n_blockPerGrid,  n_walkers_decremental>>>(device_graph_ptr, device_stream_edges_ptr, n_steps_decremental);
+                cudaDeviceSynchronize();
+                auto end_time = std::chrono::high_resolution_clock::now();
+                auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(end_time - start_time);
+                double kernel_time = duration.count() / 1000.0;
+                total_kernel_time += kernel_time;
+                cout << ">>> Decremental kernel completed in " << std::fixed << std::setprecision(3) << kernel_time << " seconds" << endl;
             }
             
             // Force flush kernel printf output
-            cudaDeviceSynchronize();
             fflush(stdout);
 
-            cout << "Download result" << endl;
+            cout << "Processing kernel results and updating sparsifier..." << endl;
             host_graph_ptr->updateSparsiferFromResult(gpu_stream_edges);
             
         }while (host_stream_edges_ptr->overflow_flag == true);
         
+        cout << "Batch " << batch_counter << " completed successfully!" << endl;
+
+        cout << "Do you want to check current graph properties? (y/n): ";
+        cin >> check_properties;
+        // check_properties = 'y'; // disable property check by default
+        if (check_properties == 'y' || check_properties == 'Y') {
+            host_graph_ptr->check_current_properties();
+        }
+
+        cout << "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━" << endl;
+        cout << endl;
+        
     }
 
+    cout << "\n╔══════════════════════════════════════════════════════════════════════════════════╗" << endl;
+    cout << "║                                PROCESSING COMPLETE                                ║" << endl;
+    cout << "║                                                                                  ║" << endl;
+    cout << "║ Total Kernel Runtime: " << std::fixed << std::setprecision(3) << std::setw(8) << total_kernel_time << " seconds" << std::setw(34) << "║" << endl;
+    cout << "╚══════════════════════════════════════════════════════════════════════════════════╝" << endl;
     
+    // Prompt user to check final graph properties
+    cout << "Do you want to check final graph properties? (y/n): ";
+    cin >> check_properties;
+    
+    if (check_properties == 'y' || check_properties == 'Y') {
+        cout << "\n┌─────────────────────────────────────────────────────────────────────────────────┐" << endl;
+        cout << "│                              FINAL GRAPH ANALYSIS                             │" << endl;
+        cout << "└─────────────────────────────────────────────────────────────────────────────────┘" << endl;
+        host_graph_ptr->check_current_properties();
+    }
 
+    cout << "Saving results to: " << output_folder << endl;
     host_graph_ptr->save_result(output_folder);
-
+    
+    cout << "Dynamic graph sparsification completed successfully!" << endl;
+    cout << "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━" << endl;
+    cout << endl;
 
 
     return 0;

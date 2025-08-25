@@ -1,4 +1,28 @@
 
+/**
+ * @file gpu_graph.cuh
+ * @brief GPU-accelerated dynamic graph processing with random walk sampling
+ * 
+ * This CUDA header implements the core GPU algorithms for dynamic graph sparsification
+ * using neighborhood-based random walks (NBRW) for both incremental and decremental updates.
+ * 
+ * Key Components:
+ * - GPU_Dual_Graph: Manages dense and sparse graph representations on GPU
+ * - GPU_Stream_Edges: Handles batch processing of edge updates
+ * - NBRW Kernels: Random walk sampling for path discovery and edge selection
+ * - Memory management: Efficient GPU memory allocation and data transfer
+ * - Integration: Julia interface for condition number analysis
+ * 
+ * Algorithm Overview:
+ * - Incremental: Sample random walks, add edges NOT found in paths to sparse graph
+ * - Decremental: Remove edges from dense graph, add replacement paths to sparse graph
+ * - Uses 512 walkers per edge with configurable maximum walk length
+ * - Block-parallel execution (1 block per edge) for optimal GPU utilization
+ * 
+ * @author Yihang Yuan
+ * @date 2025
+ */
+
 #ifndef _GPU_GRAPH_H_
 #define _GPU_GRAPH_H_
 #include <iostream>
@@ -41,9 +65,15 @@ static void HandleError( cudaError_t err,
 # define DENSE 0
 # define SPARSE 1
 
+/**
+ * @brief Utility structure for block-level reductions in CUDA kernels
+ * 
+ * Used in blockReduceMin operations to track both the minimum value
+ * and its corresponding index across thread blocks during random walk sampling.
+ */
 struct ValueIndex {
-      float value;
-      int index;
+      float value;  // The minimum value found
+      int index;    // Index/thread ID corresponding to the minimum value
 };
 
 // Forward declarations
@@ -58,28 +88,42 @@ __device__ ValueIndex reduceMin(ValueIndex a, ValueIndex b);
 __device__ ValueIndex warpReduceMin(ValueIndex val);
 __device__ ValueIndex blockReduceMin(ValueIndex val, ValueIndex* sharedData);
 
+/**
+ * @brief GPU memory manager for batch edge processing
+ * 
+ * Handles efficient transfer and processing of edge batches between host and device.
+ * Manages overflow situations when batch size exceeds GPU memory capacity.
+ * 
+ * Key Features:
+ * - Batch processing with overflow handling
+ * - Dual-buffer system for continuous processing
+ * - Random walk result storage and retrieval
+ * - Memory-efficient edge streaming
+ */
 class GPU_Stream_Edges{
 
     public:
+        // === Batch Management ===
+        size_t max_capacity;          // Maximum edges per GPU transfer
+        bool overflow_flag;           // True if current batch overflows capacity
+        size_t next_run_index;        // Next batch position to process
+        
+        // === Current Batch State ===
+        int n_steps;                  // Maximum random walk steps allowed
+        size_t batch_size;            // Total edges in current batch
+        size_t load_size;             // Edges loaded in current GPU transfer
+        
+        // === Host Memory Arrays ===
+        vertex_t * edges;             // Edge endpoints (src, dst pairs)
+        weight_t * weights;           // Edge weights
+        int * path_selected;          // Random walk path results
+        int * path_selected_flag;     // Path existence flags (-1 = not found, >=0 = found)
 
-        size_t max_capacity;
-        bool overflow_flag;
-        size_t  next_run_index;
-
-        int n_steps;
-        size_t batch_size;
-        size_t load_size;
-        vertex_t * edges;
-        weight_t * weights;
-        int * path_selected; // selected path
-        int * path_selected_flag; // path exist?
-
-
-        // Device memory
-        vertex_t *edges_device;
-        weight_t *weights_device;
-        int *path_selected_device;
-        int *path_selected_flag_device;
+        // === Device Memory Pointers ===
+        vertex_t *edges_device;       // GPU copy of edges
+        weight_t *weights_device;     // GPU copy of weights  
+        int *path_selected_device;    // GPU random walk results
+        int *path_selected_flag_device; // GPU path flags
 
 
         //heursistic recovery
@@ -249,6 +293,31 @@ class GPU_Stream_Edges{
 
 };
 
+/**
+ * @brief GPU-optimized dual graph manager for dynamic sparsification
+ * 
+ * Manages both dense and sparse graph representations simultaneously on GPU,
+ * enabling efficient incremental and decremental operations through:
+ * 
+ * Core Features:
+ * - Dual CSR representation (dense + sparse graphs)
+ * - Dynamic edge insertion/deletion with O(1) mapping
+ * - GPU memory management with overflow handling  
+ * - Integration with Julia condition number analysis
+ * - Batch processing of streaming edge updates
+ * 
+ * Memory Architecture:
+ * - Pointer-based neighbor storage for dynamic updates
+ * - Separate memory pools for static and dynamic edges
+ * - Efficient GPU-CPU data transfer mechanisms
+ * - Hash-based edge mapping for fast lookups
+ * 
+ * Algorithm Integration:
+ * - Preprocessing for edge filtering and validation
+ * - Result processing from NBRW kernel outputs
+ * - Sparsifier updates based on random walk results
+ * - Performance monitoring and reporting
+ */
 class GPU_Dual_Graph{
 
     public:
@@ -639,7 +708,7 @@ class GPU_Dual_Graph{
                     }
                 }
 
-                cout << "Incremental edges not found in NBRW: " << incremental_no_found_count << endl;
+                cout << "Random Walk Results: " << incremental_no_found_count << " edges not found (added to sparse graph)" << endl;
             } else if (g_stream_edges.current_op == DECREMENTAL){
                 // for decremental, check the path_selected_flag, if 1, add the path to sparse graph
                 for (int i = 0; i < batch_size; i++){
@@ -697,7 +766,8 @@ class GPU_Dual_Graph{
             }
 
             g_stream_edges.heuristic_sample_num = decremental_no_found_count;
-            cout << "Sparsifier updated with " << count << " edges from stream." <<  endl;
+            string operation_name = (g_stream_edges.current_op == INCREMENTAL) ? "incremental" : "decremental";
+            cout << "Sparsifier updated with " << count << " edges from " << operation_name << " stream." << endl;
             if (count > 0){
                 updateDeviceDualGraph();
             }
@@ -763,16 +833,39 @@ class GPU_Dual_Graph{
         }
 
         void check_current_properties(){
-            // Implementation goes here
-            cout << "Current Graph Properties:" << endl;
-            cout << "Vertices: " << vertex_num << endl;
-            cout << "Edges (Dense): " << edge_num[DENSE] << endl;
-            cout << "Edges (Sparse): " << edge_num[SPARSE] << endl;
-            cout << "Density (Dense): " << check_density(DENSE) << "%" << endl;
-            cout << "Density (Sparse): " << check_density(SPARSE) << "%" << endl;
-            cout << "Check CND (Julia): ";
+            cout << "\n┌─────────────────────────────────────────────────────────────────────────────────┐" << endl;
+            cout << "│                           CURRENT GRAPH PROPERTIES                              │" << endl;
+            cout << "├─────────────────────────────────────────────────────────────────────────────────┤" << endl;
+            // Create properly aligned rows (total width = 84 chars including both borders)
+            string vertex_line = "│ Vertices:      " + std::to_string(vertex_num) + " nodes";
+            cout << vertex_line << string(84 - vertex_line.length(), ' ') << "│" << endl;
+            
+            string dense_line = "│ Dense Edges:   " + std::to_string(edge_num[DENSE]) + " edges";
+            cout << dense_line << string(84 - dense_line.length(), ' ') << "│" << endl;
+            
+            string sparse_line = "│ Sparse Edges:  " + std::to_string(edge_num[SPARSE]) + " edges";
+            cout << sparse_line << string(84 - sparse_line.length(), ' ') << "│" << endl;
+            
+            ostringstream dense_density;
+            dense_density << std::fixed << std::setprecision(2) << check_density(DENSE);
+            string dense_density_line = "│ Dense Density: " + dense_density.str() + "%";
+            cout << dense_density_line << string(84 - dense_density_line.length(), ' ') << "│" << endl;
+            
+            ostringstream sparse_density;
+            sparse_density << std::fixed << std::setprecision(2) << check_density(SPARSE);
+            string sparse_density_line = "│ Sparse Density: " + sparse_density.str() + "%";
+            cout << sparse_density_line << string(84 - sparse_density_line.length(), ' ') << "│" << endl;
+            
+            // Julia computation indicator  
+            string julia_line1 = "│ Computing Condition Number with Julia...";
+            cout << julia_line1 << string(84 - julia_line1.length(), ' ') << "│" << endl;
+            
+            string julia_line2 = "│ This may take a moment...";
+            cout << julia_line2 << string(84 - julia_line2.length(), ' ') << "│" << endl;
+            
             check_CND_julia();
-            cout << "-----------------------------------" << endl;
+            cout << "└─────────────────────────────────────────────────────────────────────────────────┘" << endl;
+            
         }
 
         float check_density(int graph_type){
@@ -824,12 +917,15 @@ class GPU_Dual_Graph{
             int exit_code = pclose(pipe);
             
             if (exit_code == 0) {
-                cout << "=== Julia CND Analysis Results ===" << endl;
-                cout << result;
-                // cout << "=================================" << endl;
+                // Remove trailing newline from result
+                if (!result.empty() && result.back() == '\n') {
+                    result.pop_back();
+                }
+                string cnd_line = "│ " + result;
+                cout << cnd_line << string(84 - cnd_line.length(), ' ') << "│" << endl;
             } else {
-                cerr << "Error: Julia script failed with exit code " << exit_code << endl;
-                cerr << "Output: " << result << endl;
+                string error_line = "│ Julia script failed with exit code " + std::to_string(exit_code);
+                cout << error_line << string(84 - error_line.length(), ' ') << "│" << endl;
             }
             
             // Clean up temporary files
@@ -859,6 +955,22 @@ class GPU_Dual_Graph{
         
 };
 
+/**
+ * @brief CUDA kernel for decremental random walk sampling
+ * 
+ * Performs random walk sampling to find replacement paths when edges are removed
+ * from the dense graph during decremental updates.
+ * 
+ * Algorithm:
+ * - Each block processes one edge deletion with 512 parallel walkers
+ * - Sample alternative paths in the sparse graph to maintain connectivity
+ * - Find replacement edges that preserve graph sparsification properties
+ * - Mark successful paths for addition to sparse graph
+ * 
+ * @param G Dual graph structure (dense + sparse)
+ * @param stream_edges Current batch of edges to delete
+ * @param n_steps Maximum random walk length allowed
+ */
 __global__ void NBRW_decremental(
     GPU_Dual_Graph * G,
     GPU_Stream_Edges * stream_edges,
@@ -972,6 +1084,23 @@ __global__ void NBRW_decremental(
 
 }
 
+/**
+ * @brief CUDA kernel for incremental random walk sampling
+ * 
+ * Performs neighborhood-based random walks (NBRW) to determine which edges
+ * should be added to the sparse graph during incremental updates.
+ * 
+ * Algorithm:
+ * - Each block processes one edge with 512 parallel walkers
+ * - Sample random walks from source to target of length up to n_steps
+ * - Use block reduction to find minimum path length across all walkers
+ * - If no path found (result == -1), mark edge for addition to sparse graph
+ * 
+ * @param G Dual graph structure (dense + sparse)
+ * @param stream_edges Current batch of edges to process
+ * @param distortion Random walk distortion threshold (unused in current implementation)
+ * @param n_steps Maximum random walk length allowed
+ */
 __global__ void NBRW_incremental(
     GPU_Dual_Graph * G,
     GPU_Stream_Edges * stream_edges,

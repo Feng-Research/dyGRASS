@@ -2,6 +2,29 @@
 
 Code for dyGRASS — Dynamic Graph Spectral Sparsification via Localized Random Walks is the open-source reference implementation of the framework introduced in our ICCAD 2025 paper. dyGRASS updates spectral sparsifiers in O(1) time per edge insertion or deletion by launching GPU-accelerated non-backtracking random walks that pinpoint spectrally critical edges; this yields ~10 × speed-ups over the previous inGRASS algorithm while preserving tight spectral similarity across fully dynamic graphs.
 
+## **NEW: Improved Dynamic Implementation**
+
+We have developed an **enhanced unified implementation** in the `dynamic_update/` directory that significantly improves upon the original paper implementation:
+
+### **Key Improvements:**
+- **Unified Pipeline**: Single executable handles both incremental and decremental updates seamlessly
+- **Memory Optimized**: Efficient GPU memory management with batch processing and overflow handling
+- **Performance Enhanced**: Streamlined data structures and optimized CUDA kernels
+- **Better User Experience**: Interactive batch processing, real-time condition number analysis, and professional output formatting
+- **Simplified Setup**: Automated dataset download and single compilation step
+- **Production Ready**: Comprehensive error handling, timing reports, and result validation
+
+### **Recommended Usage:**
+```bash
+# Quick start with the improved implementation
+cd dynamic_update/
+python3 datasetdownload.py    # Download datasets
+nvcc -ccbin g++-13 -g -G main.cu functions.cpp -o debug
+./debug G2 100               # Run experiment
+```
+
+**For paper result reproduction**, use the original separate implementations in `random_walk_incremental/` and `random_walk_decremental/` directories with the setup instructions below.
+
 ## Setup
 
 ### System
