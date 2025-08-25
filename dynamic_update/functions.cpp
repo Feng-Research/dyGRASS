@@ -594,6 +594,7 @@ EdgeStream::EdgeStream(const string& folder, int base) {
     this->current_op = OperationType::INCREMENTAL;
     this->total_edges_processed = 0;
     this->manual_selection = true;
+    this->inc_only_mode = false;
     
     cout << "Initialized EdgeStream for folder: " << folder << " (base=" << base << ")" << endl;
     
@@ -644,7 +645,7 @@ bool EdgeStream::loadNextBatch() {
     cout << "Next stream file: " << next_batch_name << endl;
 
     if (manual_selection) {
-        cout << "Load next stream file? (yes/yes_always/no): ";
+        cout << "Load next stream file? (yes/yes_always/inc_only/no): ";
         string response;
         cin >> response;
         
@@ -654,10 +655,29 @@ bool EdgeStream::loadNextBatch() {
             // Load this file and disable manual selection for future
             manual_selection = false;
             cout << "Automatic loading enabled for remaining batches." << endl;
+        } else if (response == "inc_only" || response == "incremental_only") {
+            // Enable inc_only mode
+            this->inc_only_mode = true;
+            manual_selection = false;
+            cout << "Incremental-only mode enabled. Will auto-load all incremental batches and stop at first decremental." << endl;
         } else {
             // User chose not to load
             cout << "Skipping batch " << next_batch_index << endl;
             return false;
+        }
+    }
+    
+    // Handle inc_only_mode logic
+    if (this->inc_only_mode) {
+        // Check if the NEXT batch (after current) is decremental
+        int next_next_batch_index = next_batch_index + 1;
+        if (next_next_batch_index < batch_names.size()) {
+            string next_next_batch_name = batch_names[next_next_batch_index];
+            if (next_next_batch_name.find("decremental") != string::npos) {
+                cout << "Next batch will be decremental. Re-enabling manual selection after this incremental batch." << endl;
+                this->inc_only_mode = false;
+                this->manual_selection = true;
+            }
         }
     }
     

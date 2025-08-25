@@ -12,6 +12,7 @@
 #include <assert.h>
 #include <unordered_map>  // for O(1) edge mapping
 #include <unordered_set>  // for tracking added edges
+#include <filesystem>
 
 using namespace std;
 
@@ -106,6 +107,10 @@ class GPU_Stream_Edges{
             this->weights = nullptr;
             this->path_selected = new int[max_capacity * n_steps];
             this->path_selected_flag = new int[max_capacity];
+            // Initialize path_selected_flag to -1 (not found)
+            for (int i = 0; i < max_capacity; i++) {
+                this->path_selected_flag[i] = -1;
+            }
 
             this->heuristic_sample_nodes = new vertex_t[max_capacity * 2];
         
@@ -185,8 +190,8 @@ class GPU_Stream_Edges{
         }
 
         void downloadResult(){
-            cout << "DEBUG downloadResult: load_size=" << load_size << ", max_capacity=" << max_capacity << endl;
-            cout << "DEBUG downloadResult: current_op=" << current_op << ", n_steps=" << n_steps << endl;
+            // cout << "DEBUG downloadResult: load_size=" << load_size << ", max_capacity=" << max_capacity << endl;
+            // cout << "DEBUG downloadResult: current_op=" << current_op << ", n_steps=" << n_steps << endl;
             
             // Synchronize GPU to make sure kernel completed
             cudaDeviceSynchronize();
@@ -204,12 +209,10 @@ class GPU_Stream_Edges{
             }
             
             if (this->current_op == DECREMENTAL){
-                cout << "DEBUG: Copying decremental results..." << endl;
                 HRR(cudaMemcpy(path_selected, path_selected_device, sizeof(int) * load_size * n_steps, cudaMemcpyDeviceToHost));
             }
-            cout << "DEBUG: Copying path_selected_flag..." << endl;
+
             HRR(cudaMemcpy(path_selected_flag, path_selected_flag_device, sizeof(int) * load_size, cudaMemcpyDeviceToHost));
-            cout << "DEBUG: downloadResult completed successfully" << endl;
         }
 
         void heuristicRecovery(GPU_Dual_Graph * ggraph){
@@ -259,6 +262,7 @@ class GPU_Dual_Graph{
 
         // try new thing
         index_t edge_num[2];
+        index_t allocated_edge_capacity[2];  // Track original allocated size for memory operations
         unordered_map<long, EdgeInfo>  * graph_map[2]; // Edge mapping for O(1) operations
         vertex_t * degree_list[2];          // Current degrees (updated during edge removal)
         vertex_t * bin_size[2];              // Original degrees (for memory layout)
@@ -291,6 +295,7 @@ class GPU_Dual_Graph{
             for (int graph_type = 0; graph_type < 2 ; graph_type++){
                 
                 this->edge_num[graph_type] = graphs[graph_type]->edge_count;
+                this->allocated_edge_capacity[graph_type] = graphs[graph_type]->edge_count;
                 this->graph_map[graph_type] = &graphs[graph_type]->edge_map; // don't deallocate this
                 this->degree_list[graph_type] = graphs[graph_type]->degree_list; // don't deallocate this
                 this->bin_size[graph_type] = new vertex_t[vertex_num];
@@ -306,7 +311,7 @@ class GPU_Dual_Graph{
                 HRR(cudaMalloc((void **)&degree_list_device[graph_type], sizeof(vertex_t)*vertex_num));
                 HRR(cudaMalloc((void **)&bin_size_device[graph_type], sizeof(vertex_t)*vertex_num));
                 HRR(cudaMalloc((void ***)&beg_ptr_device[graph_type], sizeof(weight_t*)*vertex_num));
-                HRR(cudaMalloc((void **)&concatenated_neighbors_data_device[graph_type], sizeof(weight_t)*edge_num[graph_type]*2 * 2));
+                HRR(cudaMalloc((void **)&concatenated_neighbors_data_device[graph_type], sizeof(weight_t)*allocated_edge_capacity[graph_type]*2 * 2));
                 int offset = 0;
                 for (int i = 0; i < vertex_num; i++){
                     beg_ptr_device_content[graph_type][i] = concatenated_neighbors_data_device[graph_type] + offset;
@@ -371,7 +376,7 @@ class GPU_Dual_Graph{
                         // edge already exist so add weights to exist edges
                         cout << "Warning: Incremental Edge already exists in original graph, skip: " << u << " " << v << endl;
                         it = stream_edges.batch_edges.erase(it);
-                        ++delete_count;
+                        ++delete_count; 
 
                         // do edge weights update here, in the function automatically check sparsifier  has this edge or not
                         this->dualGraphEdgeweightsUpdate(u, v, w);
@@ -438,7 +443,7 @@ class GPU_Dual_Graph{
                 HRR(cudaMemcpy(degree_list_device[graph_type], degree_list[graph_type], sizeof(vertex_t)*vertex_num, cudaMemcpyHostToDevice));
                 HRR(cudaMemcpy(bin_size_device[graph_type], bin_size[graph_type], sizeof(vertex_t)*vertex_num, cudaMemcpyHostToDevice));
                 HRR(cudaMemcpy(beg_ptr_device[graph_type], beg_ptr_device_content[graph_type], sizeof(weight_t*)*vertex_num, cudaMemcpyHostToDevice));
-                HRR(cudaMemcpy(concatenated_neighbors_data_device[graph_type], concatenated_neighbors_data[graph_type], sizeof(weight_t)*edge_num[graph_type]*2 * 2, cudaMemcpyHostToDevice));
+                HRR(cudaMemcpy(concatenated_neighbors_data_device[graph_type], concatenated_neighbors_data[graph_type], sizeof(weight_t)*allocated_edge_capacity[graph_type]*2 * 2, cudaMemcpyHostToDevice));
             }
         }
 
@@ -466,6 +471,8 @@ class GPU_Dual_Graph{
             index_t degree_a, degree_b;
 
             if (this->graph_map[graph_type]->count(key) == 0){
+
+                this->edge_num[graph_type] += 2;
 
                 degree_a = ++this->degree_list[graph_type][a];
                 degree_b = ++this->degree_list[graph_type][b];
@@ -505,7 +512,7 @@ class GPU_Dual_Graph{
                 }
 
                 // Copy existing neighbor data to new location with expanded layout
-                for (int i = 0, j = 0; i < degree_a - 1; i++, j++) {
+                for (int i = 0, j = 0; i < (degree_a - 1) * 2 ; i++, j++) {
                     if (j % degree_a == degree_a - 1) { j++; }
                     ptr_new[j] = ptr_old[i];
                 }
@@ -553,14 +560,17 @@ class GPU_Dual_Graph{
                 index_t b_index_in_a = this->graph_map[graph_type]->at(key).index_a;
                 index_t a_index_in_b = this->graph_map[graph_type]->at(key).index_b;
 
-
+                this->edge_num[graph_type] -= 2;
                 this->graph_map[graph_type]->erase(key);
 
                 int degree_a = --this->degree_list[graph_type][a];
                 int degree_b = --this->degree_list[graph_type][b];
+                
+                if (graph_type == DENSE){
+                    assert(degree_a != 0);
+                    assert(degree_b != 0);
+                }
 
-                assert(degree_a != 0);
-                assert(degree_b != 0);
                 this->edgeDeletionForNeighborData(a, b, degree_a, b_index_in_a, graph_type);
                 this->edgeDeletionForNeighborData(b, a, degree_b, a_index_in_b, graph_type);
 
@@ -584,11 +594,23 @@ class GPU_Dual_Graph{
 
                 if (a < a_last){
                     long key = a * this->multiplier + a_last;
-                    this->graph_map[graph_type]->at(key).index_a = b_index_in_a;
+                    if (this->graph_map[graph_type]->count(key) > 0) {
+                        this->graph_map[graph_type]->at(key).index_a = b_index_in_a;
+                    } else {
+                        cerr << "Warning: Edge index update failed - edge (" << a << "," << a_last 
+                             << ") not found in graph_type " << graph_type 
+                             << " during deletion of (" << (key % this->multiplier) << "," << (key / this->multiplier) << ")" << endl;
+                    }
                 }
                 else{
                     long key = a_last * this->multiplier + a;
-                    this->graph_map[graph_type]->at(key).index_b = b_index_in_a;
+                    if (this->graph_map[graph_type]->count(key) > 0) {
+                        this->graph_map[graph_type]->at(key).index_b = b_index_in_a;
+                    } else {
+                        cerr << "Warning: Edge index update failed - edge (" << a_last << "," << a 
+                             << ") not found in graph_type " << graph_type 
+                             << " during deletion of (" << (key % this->multiplier) << "," << (key / this->multiplier) << ")" << endl;
+                    }
                 }
 
             }
@@ -607,41 +629,55 @@ class GPU_Dual_Graph{
             if (g_stream_edges.current_op == INCREMENTAL){
                 // for incremental, just add all found edges to sparse graph
                 for (int i = 0; i < batch_size; i++){
-                    if (g_stream_edges.path_selected_flag[i] != -1){
+                    if (g_stream_edges.path_selected_flag[i] == -1){
                         vertex_t a = g_stream_edges.edges[start_index + i * 2];
                         vertex_t b = g_stream_edges.edges[start_index + i * 2 + 1];
                         weight_t w = g_stream_edges.weights[start_index + i];
                         this->edgeInsertion(a, b, w, SPARSE);
-                        count++;
-                    }else{
                         incremental_no_found_count++;
+                        count++;
                     }
                 }
+
+                cout << "Incremental edges not found in NBRW: " << incremental_no_found_count << endl;
             } else if (g_stream_edges.current_op == DECREMENTAL){
                 // for decremental, check the path_selected_flag, if 1, add the path to sparse graph
                 for (int i = 0; i < batch_size; i++){
                     
-                    vertex_t a = g_stream_edges.edges[start_index + i * 2];
-                    vertex_t b = g_stream_edges.edges[start_index + i * 2 + 1];
-                    int path_length = g_stream_edges.path_selected_flag[i];
+                    vertex_t source = g_stream_edges.edges[start_index + i * 2];
+                    // vertex_t target = g_stream_edges.edges[start_index + i * 2 + 1];
+                    int targetFoundAt = g_stream_edges.path_selected_flag[i];
 
-                    if (path_length != 0){
+                    vertex_t p, q;
+                    vertex_t a, b;
+                    p = source;
+
+                    if (targetFoundAt !=  -1){
                         
                         int path_start = i * g_stream_edges.n_steps;
 
-                        for (int j = 0; j < path_length; j++){
+                        for (int j = 0; j <= targetFoundAt; j++){
 
-                            vertex_t b = g_stream_edges.path_selected[path_start + j];
+                            q = g_stream_edges.path_selected[path_start + j];
+
+                            a = p;
+                            b = q;
+
                             if ( a > b) swap(a, b);
                             long key = a * this->multiplier + b;
 
                             if (this->graph_map[SPARSE]->count(key) == 0){
-                                count++;
-                                weight_t weight = this->graph_map[DENSE]->at(key).weight;
-                                this->edgeInsertion(a, b, weight, SPARSE);
+                                // Check if edge exists in dense graph before accessing
+                                if (this->graph_map[DENSE]->count(key) > 0) {
+                                    count++;
+                                    weight_t weight = this->graph_map[DENSE]->at(key).weight;
+                                    this->edgeInsertion(a, b, weight, SPARSE);
+                                } else {
+                                    cout << "Warning: Path edge not found in dense graph: " << a << " " << b << endl;
+                                }
                             }
                             
-                            a = b;
+                            p = q;
 
                         }
                         
@@ -656,6 +692,8 @@ class GPU_Dual_Graph{
                     }
                 }
 
+                cout << "Decremental edges not found in NBRW: " << decremental_no_found_count << endl;
+
             }
 
             g_stream_edges.heuristic_sample_num = decremental_no_found_count;
@@ -664,8 +702,9 @@ class GPU_Dual_Graph{
                 updateDeviceDualGraph();
             }
 
+
             if(decremental_no_found_count > 0){
-                cout << "Not implemented yet" << endl;
+                // cout << "Not implemented yet" << endl;
                 cout << "Heuristic recovery needed for " << decremental_no_found_count << " edges." <<  endl;
                 g_stream_edges.heuristicRecovery(this);
                 
@@ -685,15 +724,18 @@ class GPU_Dual_Graph{
         
         void save_result(string folder_name){
             
-            system(("mkdir -p " + folder_name).c_str());
+            if (!std::filesystem::exists(folder_name)) {
+                std::filesystem::create_directories(folder_name);
+            }
+            // system(("mkdir -p " + folder_name).c_str());
             string dense_path = folder_name + "/adj_dense.mtx";
             string sparse_path = folder_name + "/adj_sparse.mtx";
             
             // Save dense graph
             std::ofstream dense_file(dense_path, std::ios::out);
             if(dense_file.is_open()){
-                dense_file << "%%MatrixMarket matrix coordinate real general\n";
-                dense_file << vertex_num << " " << vertex_num << " " << edge_num[DENSE] << "\n";
+                // dense_file << "%%MatrixMarket matrix coordinate real general\n";
+                // dense_file << vertex_num << " " << vertex_num << " " << edge_num[DENSE] << "\n";
 
                 for (const auto& [key, edge_info] : *graph_map[DENSE]) {  // C++17 structured binding
                     vertex_t u = key / multiplier;
@@ -701,14 +743,14 @@ class GPU_Dual_Graph{
                     dense_file << (u + 1) << " " << (v + 1) << " " << edge_info.weight << "\n";
                 }
                 dense_file.close();
-                cout << "Dense graph saved to " << dense_path << endl;
+                // cout << "Dense graph saved to " << dense_path << endl;
             }
 
             // Save sparse graph
             std::ofstream sparse_file(sparse_path, std::ios::out);
             if(sparse_file.is_open()){
-                sparse_file << "%%MatrixMarket matrix coordinate real general\n";
-                sparse_file << vertex_num << " " << vertex_num << " " << edge_num[SPARSE] << "\n";
+                // sparse_file << "%%MatrixMarket matrix coordinate real general\n";
+                // sparse_file << vertex_num << " " << vertex_num << " " << edge_num[SPARSE] << "\n";
 
                 for (const auto& [key, edge_info] : *graph_map[SPARSE]) {
                     vertex_t u = key / multiplier;
@@ -716,11 +758,88 @@ class GPU_Dual_Graph{
                     sparse_file << (u + 1) << " " << (v + 1) << " " << edge_info.weight << "\n";
                 }
                 sparse_file.close();
-                cout << "Sparse graph saved to " << sparse_path << endl;
+                // cout << "Sparse graph saved to " << sparse_path << endl;
             }
         }
 
+        void check_current_properties(){
+            // Implementation goes here
+            cout << "Current Graph Properties:" << endl;
+            cout << "Vertices: " << vertex_num << endl;
+            cout << "Edges (Dense): " << edge_num[DENSE] << endl;
+            cout << "Edges (Sparse): " << edge_num[SPARSE] << endl;
+            cout << "Density (Dense): " << check_density(DENSE) << "%" << endl;
+            cout << "Density (Sparse): " << check_density(SPARSE) << "%" << endl;
+            cout << "Check CND (Julia): ";
+            check_CND_julia();
+            cout << "-----------------------------------" << endl;
+        }
 
+        float check_density(int graph_type){
+            // Implementation goes here
+            if (graph_type < 0 || graph_type > 1) {
+                cerr << "Invalid graph type. Use 0 for DENSE or 1 for SPARSE." << endl;
+                exit(-1);
+            }
+            // Verify edge count consistency: edge_num counts directed edges, map_size counts undirected
+            size_t map_size = this->graph_map[graph_type]->size();
+            if (this->edge_num[graph_type] / 2 != map_size) {
+                cerr << "Edge count mismatch for graph " << graph_type 
+                     << ": edge_num=" << this->edge_num[graph_type] 
+                     << " (directed), map_size=" << map_size << " (undirected)" << endl;
+                assert(false);
+            }
+            float density = ( (static_cast<float> (edge_num[graph_type]) / 2 / (float)(vertex_num)) - 1)* 100;
+            // float density = static_cast<float>(edge_num[graph_type]) / (vertex_num * (vertex_num - 1) / 2);
+            return density;
+        }
+
+        void check_CND_julia(){
+            string temp_location = ".";
+            string dense_path = temp_location + "/adj_dense.mtx";
+            string sparse_path = temp_location + "/adj_sparse.mtx";
+            
+            save_result(temp_location);
+
+            // Call Julia script and capture output
+            string julia_command = "julia cnd_analysis.jl";
+            
+            FILE* pipe = popen(julia_command.c_str(), "r");
+            if (!pipe) {
+                cerr << "Error: Failed to execute Julia script" << endl;
+                // Clean up temp files even on error
+                std::filesystem::remove(dense_path);
+                std::filesystem::remove(sparse_path);
+                return;
+            }
+            
+            char buffer[256];
+            string result = "";
+            
+            // Read output from Julia script
+            while (fgets(buffer, sizeof(buffer), pipe) != nullptr) {
+                result += buffer;
+            }
+            
+            int exit_code = pclose(pipe);
+            
+            if (exit_code == 0) {
+                cout << "=== Julia CND Analysis Results ===" << endl;
+                cout << result;
+                // cout << "=================================" << endl;
+            } else {
+                cerr << "Error: Julia script failed with exit code " << exit_code << endl;
+                cerr << "Output: " << result << endl;
+            }
+            
+            // Clean up temporary files
+            if (std::filesystem::remove(dense_path)) {
+                // cout << "Cleaned up: " << dense_path << endl;
+            }
+            if (std::filesystem::remove(sparse_path)) {
+                // cout << "Cleaned up: " << sparse_path << endl;
+            }
+        }
 
         ~GPU_Dual_Graph(){ 
             for (int graph_type = 0; graph_type < 2; graph_type++){
@@ -825,7 +944,7 @@ __global__ void NBRW_decremental(
     if (targetFoundAt != -1) {
         result = {total_R, (int)threadIdx.x};
     }else{
-        result = {__FLT_MAX__, -1};
+        result = {__FLT_MAX__, (int)threadIdx.x};
     }
     
     __syncthreads();
@@ -888,10 +1007,10 @@ __global__ void NBRW_incremental(
     weight_t * neighbors = G->beg_ptr_device[SPARSE][currentVertex];
     
     // Debug: Print degree info for first few blocks
-    if (blockIdx.x < 5 && threadIdx.x == 0) {
-        printf("DEBUG kernel block %d: currentVertex=%u, degree=%u, bin_size=%u\n", 
-               blockIdx.x, currentVertex, degree, bin_size);
-    }
+    // if (blockIdx.x < 5 && threadIdx.x == 0) {
+    //     printf("DEBUG kernel block %d: currentVertex=%u, degree=%u, bin_size=%u\n", 
+    //            blockIdx.x, currentVertex, degree, bin_size);
+    // }
     unsigned int next = curand(&local_state) % degree;
     unsigned int nextVertex = static_cast<unsigned int>(neighbors[next]);
     float resistance = 1 / neighbors[bin_size + next];
@@ -951,7 +1070,7 @@ __global__ void NBRW_incremental(
     if (targetFoundAt != -1) {
         result = {total_R, (int)threadIdx.x};
     }else{
-        result = {__FLT_MAX__, -1};
+        result = {__FLT_MAX__, (int)threadIdx.x};
     }
 
     __syncthreads();
@@ -1048,7 +1167,7 @@ __device__ ValueIndex blockReduceMin(ValueIndex val, ValueIndex* sharedData) {
           if (threadIdx.x < blockDim.x / 32) {
               val = sharedData[threadIdx.x];  // Load valid data
           } else {
-              val = {__FLT_MAX__, -1};        // Safe initialization
+              val = {__FLT_MAX__, (int)threadIdx.x};        // Use valid thread index
           }
           val = warpReduceMin(val);  // Now safe - all threads have valid data
       }

@@ -77,7 +77,7 @@ end
 function readMtx(Inp; base = 0, type = "adj", weighted = true, sort = true)
     # the output should be 1-based as Julia is 1-based
     # type can be adj or lap
-    println("Reading ", Inp, " with base ", base, " and type ", type, " and weighted ", weighted)
+    # println("Reading ", Inp, " with base ", base, " and type ", type, " and weighted ", weighted)
     io = open(Inp, "r")
     
    

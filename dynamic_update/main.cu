@@ -91,6 +91,16 @@ int main(int argc, char *argv[]){
     HRR(cudaMemcpy(device_stream_edges_ptr, host_stream_edges_ptr, sizeof(GPU_Stream_Edges), cudaMemcpyHostToDevice));
 
     while (edge_stream.loadNextBatch()){
+
+        // Prompt user to check current graph properties
+        char check_properties;
+        cout << "\nDo you want to check current graph properties? (y/n): ";
+        cin >> check_properties;
+        // check_properties = 'y'; // disable property check by default
+        if (check_properties == 'y' || check_properties == 'Y') {
+            host_graph_ptr->check_current_properties();
+        }
+
         host_graph_ptr->preprocessStreamEdges(edge_stream);
         host_stream_edges_ptr->loadEdgeFromStream(edge_stream);
 
@@ -117,6 +127,7 @@ int main(int argc, char *argv[]){
         
     }
 
+    
 
     host_graph_ptr->save_result(output_folder);
 

@@ -164,6 +164,7 @@ class EdgeStream {
     size_t total_edges_processed;             // Running count of processed edges
     vector<size_t> batch_sizes;               // Edge count per batch for analysis
     bool manual_selection;
+    bool inc_only_mode;
     
     
     EdgeStream(const string& folder, int base);
