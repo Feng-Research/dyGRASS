@@ -19,8 +19,8 @@ We have developed an **enhanced unified implementation** in the `dynamic_update/
 # Quick start with the improved implementation
 cd dynamic_update/
 python3 datasetdownload.py    # Download datasets
-nvcc -ccbin g++-13 -g -G main.cu functions.cpp -o debug
-./debug G2 100               # Run experiment
+nvcc -ccbin g++-13 main.cu functions.cpp -o dynamic_update
+./dynamic_update G2 100      # Run experiment
 ```
 
 **For paper result reproduction**, use the original separate implementations in `random_walk_incremental/` and `random_walk_decremental/` directories with the setup instructions below.

@@ -40,38 +40,18 @@ cd .. && uv venv && cd dynamic_update/
 ### 3. Compile
 ```bash
 # Compile the unified dynamic implementation
-nvcc -ccbin g++-13 -g -G main.cu functions.cpp -o debug
+nvcc -ccbin g++-13 main.cu functions.cpp -o dynamic_update
 ```
 
 ### 4. Run Experiments
 ```bash
 # Basic usage
-./debug <graph_name> <distortion_threshold>
+./dynamic_update <graph_name> <distortion_threshold>
 
 # Examples
-./debug G2 100              # Small test graph
-./debug fe_4elt 100         # Finite element mesh
-./debug AS365 100           # Network topology
+./dynamic_update G2 10              # Small test graph
 ```
 
-## Available Datasets
-
-The implementation includes 14 ready-to-use datasets:
-
-### Network/Topology Graphs
-- **333SP** - Small-world network
-- **AS365** - Autonomous system topology  
-- **G2**, **G3** - Graph benchmark instances
-
-### Finite Element Meshes
-- **M6** - Mesh benchmark
-- **NACA** - Airfoil mesh
-- **fe_4elt** - 4-element finite element
-- **fe_ocean** - Ocean mesh
-- **fe_sphere** - Spherical mesh
-
-### Deletion Test Sets
-- **del18** through **del22** - Edge deletion benchmarks
 
 ## File Structure
 
@@ -115,7 +95,7 @@ Results are saved to `./output/<graph_name>/<timestamp>/`:
 ## Command Line Options
 
 ```bash
-./debug <graph_name> <distortion_threshold> [inc_steps] [dec_steps] [inc_walkers] [dec_walkers]
+./dynamic_update <graph_name> <distortion_threshold> [inc_steps] [dec_steps] [inc_walkers] [dec_walkers]
 ```
 
 **Parameters:**
@@ -159,8 +139,8 @@ The unified implementation provides significant improvements over separate incre
 - **Compilation errors**: Ensure `nvcc` is in PATH and CUDA toolkit is properly installed
 - **Julia errors**: Install required packages: Laplacians.jl, SparseArrays.jl, Arpack.jl
 
-### Debug Mode
-The executable is compiled with debug information (`-g -G`) for development and troubleshooting.
+### Compilation Notes
+The executable is compiled for optimal performance. For debugging, add `-g -G` flags to enable debug information.
 
 ## Citation
 
